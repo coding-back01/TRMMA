@@ -118,11 +118,11 @@ def gen_map(map_dir, out_dir):
 
 def parse_trajs(ori_dir, mode, low_cate, tz, scale):
     if mode == 'train':
-        ori_file = os.path.join(ori_dir, "traj_train_{}".format(scale))
+        ori_file = os.path.join(ori_dir, "traj_train.csv")
     elif mode == 'valid':
-        ori_file = os.path.join(ori_dir, "traj_valid")
+        ori_file = os.path.join(ori_dir, "traj_valid.csv")
     elif mode == 'test':
-        ori_file = os.path.join(ori_dir, "traj_test")
+        ori_file = os.path.join(ori_dir, "traj_test.csv")
     else:
         raise NotImplementedError
 

@@ -13,6 +13,7 @@ import datetime as dt
 from tqdm import tqdm
 
 from .utils import LimitedSizeDict, load_paths2
+import networkx as nx
 
 
 def get_road_graph(workspace):
