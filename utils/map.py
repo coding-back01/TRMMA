@@ -150,6 +150,8 @@ class RoadNetworkMap:
         wayFile = open(os.path.join(dir, 'wayTypeOSM.txt'))
         for line in wayFile.readlines():
             item_list = line.strip().split()
+            if len(item_list) == 0:  # 跳过空行
+                continue
             roadId = int(item_list[0])
             wayId = int(item_list[-1])
             self.wayType[roadId] = wayId
@@ -524,6 +526,8 @@ class RoadNetworkMapFull:
 
         for line in edgeFile.readlines():
             item_list = line.strip().split()
+            if len(item_list) == 0:  # 跳过空行
+                continue
             a = int(item_list[1])
             b = int(item_list[2])
             self.edgeNode.append((a, b))
@@ -632,6 +636,8 @@ class RoadNetworkMapFull:
         wayFile = open(os.path.join(dir, 'wayTypeOSM.txt'))
         for line in wayFile.readlines():
             item_list = line.strip().split()
+            if len(item_list) == 0:  # 跳过空行
+                continue
             roadId = int(item_list[0])
             wayId = int(item_list[-1])
             self.wayType[roadId] = wayId

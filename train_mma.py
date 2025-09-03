@@ -140,7 +140,7 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--attn_flag', action='store_true', help='flag of using attention')
     parser.add_argument('--transformer_layers', type=int, default=2)
-    parser.add_argument("--gpu_id", type=str, default="1")
+    parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
     parser.add_argument('--train_flag', action='store_true', help='flag of training')
     parser.add_argument('--test_flag', action='store_true', help='flag of testing')
@@ -202,7 +202,11 @@ def main():
         raise NotImplementedError
 
     print('Preparing data...')
-    map_root = os.path.join("data", opts.city, "roadnet")
+    # 修复 porto 数据集路径映射
+    if opts.city == "porto":
+        map_root = os.path.join("data", "porto_large", "roadnet")
+    else:
+        map_root = os.path.join("data", opts.city, "roadnet")
     rn = RoadNetworkMapFull(map_root, zone_range=zone_range, unit_length=50)
 
     args = AttrDict()
@@ -263,7 +267,11 @@ def main():
     print(args)
     logging.info(args_dict)
 
-    traj_root = os.path.join("data", args.city)
+    # 修复 porto 数据集轨迹路径映射
+    if args.city == "porto":
+        traj_root = os.path.join("data", "porto_large")
+    else:
+        traj_root = os.path.join("data", args.city)
     if opts.train_flag:
         train_dataset = GPS2SegData(rn, traj_root, mbr, args, 'train')
         valid_dataset = GPS2SegData(rn, traj_root, mbr, args, 'valid')
@@ -273,8 +281,8 @@ def main():
         logging.info('training dataset shape: ' + str(len(train_dataset)))
         logging.info('validation dataset shape: ' + str(len(valid_dataset)))
 
-        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x), num_workers=opts.num_worker, pin_memory=False)
-        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=8, pin_memory=False)
+        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
+        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=8, pin_memory=False)
 
         model = GPS2Seg(args).to(device)
 
@@ -338,7 +346,7 @@ def main():
         print('testing dataset shape: ' + str(len(test_dataset)))
         logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=8, pin_memory=True)
+        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=8, pin_memory=True)
 
         model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
         print('==> Model Loaded')
