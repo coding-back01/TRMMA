@@ -38,34 +38,34 @@ def collate_fn(data):
 
 
 def train(model, iterator, optimizer, device):
-    criterion_bce = nn.BCELoss(reduction='mean')
+    criterion_bce = nn.BCELoss(reduction='mean')  # 创建二元交叉熵损失函数，使用平均值作为reduction
 
-    epoch_train_id_loss = 0
-    model.train()
-    for i, batch in enumerate(iterator):
-        src_seqs, src_lengths, _, candi_labels, candi_ids, candi_feats, candi_masks = batch
+    epoch_train_id_loss = 0  # 初始化训练损失累计值
+    model.train()  # 设置模型为训练模式
+    for i, batch in enumerate(iterator):  # 遍历数据迭代器中的每个批次
+        src_seqs, src_lengths, _, candi_labels, candi_ids, candi_feats, candi_masks = batch  # 解包批次数据
 
-        src_seqs = src_seqs.to(device, non_blocking=True)
-        candi_labels = candi_labels.float().to(device, non_blocking=True)
-        candi_ids = candi_ids.to(device, non_blocking=True)
-        candi_feats = candi_feats.to(device, non_blocking=True)
-        candi_masks = candi_masks.to(device, non_blocking=True)
+        src_seqs = src_seqs.to(device, non_blocking=True)  # 将源序列移动到指定设备（GPU/CPU）
+        candi_labels = candi_labels.float().to(device, non_blocking=True)  # 将候选标签转换为浮点数并移动到设备
+        candi_ids = candi_ids.to(device, non_blocking=True)  # 将候选ID移动到设备
+        candi_feats = candi_feats.to(device, non_blocking=True)  # 将候选特征移动到设备
+        candi_masks = candi_masks.to(device, non_blocking=True)  # 将候选掩码移动到设备
 
-        output_ids = model(src_seqs, src_lengths, candi_ids, candi_feats, candi_masks)
+        output_ids = model(src_seqs, src_lengths, candi_ids, candi_feats, candi_masks)  # 前向传播，获取模型输出
 
         # for bbp
-        bce_loss = criterion_bce(output_ids, candi_labels) * candi_ids.shape[-1]
+        bce_loss = criterion_bce(output_ids, candi_labels) * candi_ids.shape[-1]  # 计算二元交叉熵损失并乘以候选数量
 
-        optimizer.zero_grad(set_to_none=True)
-        bce_loss.backward()
-        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)  # 清零梯度，使用set_to_none=True提高性能
+        bce_loss.backward()  # 反向传播计算梯度
+        optimizer.step()  # 更新模型参数
 
-        epoch_train_id_loss += bce_loss.item()
+        epoch_train_id_loss += bce_loss.item()  # 累加当前批次的损失值
 
-        if len(iterator) >= 10 and (i + 1) % (len(iterator) // 10) == 0:
-            print("==>{}: {}".format((i + 1) // (len(iterator) // 10), epoch_train_id_loss / (i + 1)))
+        if len(iterator) >= 10 and (i + 1) % (len(iterator) // 10) == 0:  # 每10%的进度打印一次损失
+            print("==>{}: {}".format((i + 1) // (len(iterator) // 10), epoch_train_id_loss / (i + 1)))  # 打印当前进度和平均损失
 
-    return epoch_train_id_loss / len(iterator)
+    return epoch_train_id_loss / len(iterator)  # 返回整个epoch的平均损失
 
 
 def evaluate(model, iterator, device):
