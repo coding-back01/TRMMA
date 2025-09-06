@@ -673,185 +673,217 @@ class GPSEncoder(nn.Module):
         return outputs, hidden
 
 
+# 图路径编码器类，用于处理GPS轨迹和路径信息的联合编码
 class GREncoder(nn.Module):
 
-    def __init__(self, parameters):
-        super().__init__()
-        self.hid_dim = parameters.hid_dim
-        self.pro_features_flag = parameters.pro_features_flag
+    def __init__(self, parameters):  # 初始化函数，接收参数配置
+        super().__init__()  # 调用父类初始化函数
+        self.hid_dim = parameters.hid_dim  # 隐藏层维度
+        self.pro_features_flag = parameters.pro_features_flag  # 是否使用轨迹特征标志
 
-        self.transformer = GRFormer(parameters.hid_dim, parameters.transformer_layers, heads=parameters.heads)
+        # Transformer编码器，用于处理GPS和路径的联合表示
+        self.transformer = GRFormer(parameters.hid_dim, parameters.transformer_layers, heads=parameters.heads)  # 图路径Transformer模型
 
-        if self.pro_features_flag:
-            self.temporal = nn.Embedding(parameters.pro_input_dim, parameters.pro_output_dim)
-            self.fc_hid = nn.Linear(parameters.hid_dim + parameters.pro_output_dim, parameters.hid_dim)
+        if self.pro_features_flag:  # 如果使用轨迹特征
+            # 时间特征嵌入层
+            self.temporal = nn.Embedding(parameters.pro_input_dim, parameters.pro_output_dim)  # 时间特征嵌入
+            # 特征融合全连接层
+            self.fc_hid = nn.Linear(parameters.hid_dim + parameters.pro_output_dim, parameters.hid_dim)  # 隐藏状态融合层
 
-    def forward(self, src, src_len, route, route_len, pro_features):
-        # src = [src len, batch size, 3]
-        # if only input trajectory, input dim = 2; elif input trajectory + behavior feature, input dim = 2 + n
-        # src_len = [batch size]
-        bs = src.size(1)
-        src_max_len = src.size(0)
-        route_max_len = route.size(0)
+    def forward(self, src, src_len, route, route_len, pro_features):  # 前向传播函数
+        # src = [src len, batch size, 3]  # GPS轨迹输入
+        # if only input trajectory, input dim = 2; elif input trajectory + behavior feature, input dim = 2 + n  # 输入维度说明
+        # src_len = [batch size]  # 源序列长度
+        bs = src.size(1)  # 批次大小
+        src_max_len = src.size(0)  # GPS序列最大长度
+        route_max_len = route.size(0)  # 路径序列最大长度
 
-        mask3d = torch.ones(bs, src_max_len, src_max_len, device=src.device)
-        route_mask3d = torch.ones(bs, route_max_len, route_max_len, device=src.device)
-        route_mask2d = torch.ones(bs, route_max_len, device=src.device)
-        inter_mask = torch.ones(bs, route_max_len, src_max_len, device=src.device)
+        # 创建注意力掩码矩阵
+        mask3d = torch.ones(bs, src_max_len, src_max_len, device=src.device)  # GPS自注意力掩码
+        route_mask3d = torch.ones(bs, route_max_len, route_max_len, device=src.device)  # 路径自注意力掩码
+        route_mask2d = torch.ones(bs, route_max_len, device=src.device)  # 路径序列掩码
+        inter_mask = torch.ones(bs, route_max_len, src_max_len, device=src.device)  # GPS-路径交互掩码
 
-        mask3d = sequence_mask3d(mask3d, src_len, src_len)
-        route_mask3d = sequence_mask3d(route_mask3d, route_len, route_len)
-        route_mask2d = sequence_mask(route_mask2d, route_len).transpose(0,1).unsqueeze(-1).repeat(1, 1, self.hid_dim)
-        inter_mask = sequence_mask3d(inter_mask, route_len, src_len)
+        # 应用序列长度掩码
+        mask3d = sequence_mask3d(mask3d, src_len, src_len)  # 应用GPS序列掩码
+        route_mask3d = sequence_mask3d(route_mask3d, route_len, route_len)  # 应用路径序列掩码
+        route_mask2d = sequence_mask(route_mask2d, route_len).transpose(0,1).unsqueeze(-1).repeat(1, 1, self.hid_dim)  # 扩展路径掩码维度
+        inter_mask = sequence_mask3d(inter_mask, route_len, src_len)  # 应用交互掩码
 
-        src = src.transpose(0, 1)
-        route = route.transpose(0, 1)
-        outputs = self.transformer(src, route, mask3d, route_mask3d, inter_mask)
-        outputs = outputs.transpose(0, 1)  # [src len, bs, hid dim]
+        # 调整输入维度顺序
+        src = src.transpose(0, 1)  # 转换GPS输入维度顺序
+        route = route.transpose(0, 1)  # 转换路径输入维度顺序
+        # Transformer编码过程
+        outputs = self.transformer(src, route, mask3d, route_mask3d, inter_mask)  # 通过Transformer编码
+        outputs = outputs.transpose(0, 1)  # [src len, bs, hid dim]  # 恢复输出维度顺序
 
-        # idx = [i for i in range(bs)]
-        # hidden = outputs[[i - 1 for i in src_len], idx, :].unsqueeze(0)
-        assert outputs.size(0) == route_max_len
+        # idx = [i for i in range(bs)]  # 批次索引（注释掉的代码）
+        # hidden = outputs[[i - 1 for i in src_len], idx, :].unsqueeze(0)  # 获取最后时刻隐藏状态（注释掉的代码）
+        assert outputs.size(0) == route_max_len  # 确保输出长度正确
 
-        outputs = outputs * route_mask2d
-        hidden = torch.sum(outputs, dim=0) / route_len.unsqueeze(-1).repeat(1, self.hid_dim)
-        hidden = hidden.unsqueeze(0)
+        # 计算平均池化隐藏状态
+        outputs = outputs * route_mask2d  # 应用掩码到输出
+        hidden = torch.sum(outputs, dim=0) / route_len.unsqueeze(-1).repeat(1, self.hid_dim)  # 计算加权平均隐藏状态
+        hidden = hidden.unsqueeze(0)  # 增加维度
 
-        if self.pro_features_flag:
-            extra_emb = self.temporal(pro_features)
-            extra_emb = extra_emb.unsqueeze(0)
-            hidden = torch.tanh(self.fc_hid(torch.cat((extra_emb, hidden), dim=-1)))
+        if self.pro_features_flag:  # 如果使用轨迹特征
+            # 融合时间特征
+            extra_emb = self.temporal(pro_features)  # 获取时间特征嵌入
+            extra_emb = extra_emb.unsqueeze(0)  # 增加维度
+            hidden = torch.tanh(self.fc_hid(torch.cat((extra_emb, hidden), dim=-1)))  # 融合特征并激活
 
-        return outputs, hidden
+        return outputs, hidden  # 返回编码输出和隐藏状态
 
 
+# 多任务解码器类，用于同时预测路段ID和通行率
 class DecoderMulti(nn.Module):
 
     def __init__(self, parameters):
         super().__init__()
 
-        self.id_size = parameters.id_size
-        self.emb_id = None # updated in encoder
-        self.dest_type = parameters.dest_type
-        self.rate_flag = parameters.rate_flag
-        self.prog_flag = parameters.prog_flag
+        self.id_size = parameters.id_size  # 路段ID总数
+        self.emb_id = None # updated in encoder  # 路段ID嵌入层，在编码器中更新
+        self.dest_type = parameters.dest_type  # 目的地类型
+        self.rate_flag = parameters.rate_flag  # 是否预测通行率标志
+        self.prog_flag = parameters.prog_flag  # 是否使用渐进式解码标志
 
-        self.rid_feats_flag = parameters.rid_feats_flag
+        self.rid_feats_flag = parameters.rid_feats_flag  # 是否使用路段特征标志
 
-        # self.temporal_flag = False
-        # self.prev_flag = False
-        # self.max_dist = 500
-        # self.src_len = 2
+        # self.temporal_flag = False  # 时间特征标志（注释掉）
+        # self.prev_flag = False  # 历史信息标志（注释掉）
+        # self.max_dist = 500  # 最大距离（注释掉）
+        # self.src_len = 2  # 源序列长度（注释掉）
 
-        rnn_input_dim = parameters.hid_dim
-        if self.rid_feats_flag:
-            rnn_input_dim += parameters.rid_fea_dim
-        if self.rate_flag:
-            rnn_input_dim += 1
-        if self.dest_type in [1, 2]:
-            rnn_input_dim += parameters.hid_dim
-            if self.rid_feats_flag:
-                rnn_input_dim += parameters.rid_fea_dim
-            if self.rate_flag:
-                rnn_input_dim += 1
-        # if self.temporal_flag:
+        # 计算RNN输入维度
+        rnn_input_dim = parameters.hid_dim  # 基础隐藏维度
+        if self.rid_feats_flag:  # 如果使用路段特征
+            rnn_input_dim += parameters.rid_fea_dim  # 增加路段特征维度
+        if self.rate_flag:  # 如果预测通行率
+            rnn_input_dim += 1  # 增加通行率维度
+        if self.dest_type in [1, 2]:  # 如果目的地类型为1或2
+            rnn_input_dim += parameters.hid_dim  # 增加目的地嵌入维度
+            if self.rid_feats_flag:  # 如果使用路段特征
+                rnn_input_dim += parameters.rid_fea_dim  # 再次增加路段特征维度
+            if self.rate_flag:  # 如果预测通行率
+                rnn_input_dim += 1  # 再次增加通行率维度
+        # if self.temporal_flag:  # 时间特征处理（注释掉）
         #     self.temporal_dist_embedding = nn.Embedding(self.max_dist, parameters.hid_dim // self.src_len)
         #     rnn_input_dim += parameters.hid_dim
-        # self.fusion_mlp = nn.Sequential(
+        # self.fusion_mlp = nn.Sequential(  # 特征融合MLP（注释掉）
         #     nn.Linear(rnn_input_dim, 2 * parameters.hid_dim),
         #     nn.ReLU(),
         #     nn.Linear(2 * parameters.hid_dim, parameters.hid_dim)
         # )
-        self.rnn = nn.GRU(rnn_input_dim, parameters.hid_dim)
+        
+        # RNN解码器
+        self.rnn = nn.GRU(rnn_input_dim, parameters.hid_dim)  # GRU循环神经网络
 
-        # if self.prev_flag:
+        # if self.prev_flag:  # 历史信息处理（注释掉）
         #     self.observed_mlp = nn.Linear(parameters.hid_dim + parameters.rid_fea_dim + 1, parameters.hid_dim)
         #     self.observed_attn = Attention(parameters.hid_dim)
 
-        self.attn_route = Attention(parameters.hid_dim)
+        # 路径注意力机制
+        self.attn_route = Attention(parameters.hid_dim)  # 路径注意力层
 
-        if self.rate_flag:
-            fc_rate_out_input_dim = parameters.hid_dim + parameters.hid_dim
-            self.fc_rate_out = nn.Sequential(
-                nn.Linear(fc_rate_out_input_dim, parameters.hid_dim * 2),
-                nn.ReLU(),
-                nn.Linear(parameters.hid_dim * 2, 1),
-                nn.Sigmoid()
+        # 通行率预测网络
+        if self.rate_flag:  # 如果需要预测通行率
+            fc_rate_out_input_dim = parameters.hid_dim + parameters.hid_dim  # 通行率预测输入维度
+            self.fc_rate_out = nn.Sequential(  # 通行率预测全连接网络
+                nn.Linear(fc_rate_out_input_dim, parameters.hid_dim * 2),  # 第一层线性变换
+                nn.ReLU(),  # ReLU激活函数
+                nn.Linear(parameters.hid_dim * 2, 1),  # 第二层线性变换
+                nn.Sigmoid()  # Sigmoid激活函数，输出0-1之间的概率
             )
 
+    # 单步解码函数
     def decoding_step(self, input_id, input_rate, hidden, route_outputs,
                       route_attn_mask, d_rids, d_rates, rid_features_dict, dt, observed_emb, observed_mask):
 
-        rnn_input = self.emb_id[input_id]
-        if self.rid_feats_flag:
-            rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)
-        if self.rate_flag:
-            rnn_input = torch.cat((rnn_input, input_rate), dim=-1)
-        if self.dest_type in [1, 2]:
-            embed_drids = self.emb_id[d_rids]
-            rnn_input = torch.cat((rnn_input, embed_drids), dim=-1)
-            if self.rid_feats_flag:
-                rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)
-            if self.rate_flag:
-                rnn_input = torch.cat((rnn_input, d_rates), dim=-1)
-        # if self.temporal_flag:
+        rnn_input = self.emb_id[input_id]  # 获取输入路段ID的嵌入表示
+        if self.rid_feats_flag:  # 如果使用路段特征
+            rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)  # 拼接路段特征
+        if self.rate_flag:  # 如果使用通行率
+            rnn_input = torch.cat((rnn_input, input_rate), dim=-1)  # 拼接通行率信息
+        if self.dest_type in [1, 2]:  # 如果目的地类型为1或2
+            embed_drids = self.emb_id[d_rids]  # 获取目的地路段嵌入
+            rnn_input = torch.cat((rnn_input, embed_drids), dim=-1)  # 拼接目的地嵌入
+            if self.rid_feats_flag:  # 如果使用路段特征
+                rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)  # 拼接路段特征
+            if self.rate_flag:  # 如果使用通行率
+                rnn_input = torch.cat((rnn_input, d_rates), dim=-1)  # 拼接目的地通行率
+        # if self.temporal_flag:  # 时间特征处理（注释掉）
         #     rnn_input = torch.cat((rnn_input, dt), dim=-1)
-        # rnn_input = self.fusion_mlp(rnn_input)
-        rnn_input = rnn_input.unsqueeze(0)
+        # rnn_input = self.fusion_mlp(rnn_input)  # 特征融合（注释掉）
+        rnn_input = rnn_input.unsqueeze(0)  # 增加时间步维度
 
-        output, hidden = self.rnn(rnn_input, hidden)
+        # RNN前向传播
+        output, hidden = self.rnn(rnn_input, hidden)  # RNN解码步骤
 
-        if False:
-            observed_emb = observed_emb.unsqueeze(1)
-            _, observed_weighted = self.observed_attn(hidden.permute(1, 0, 2), observed_emb, observed_emb, observed_mask.unsqueeze(1))
-            query = hidden.permute(1, 0, 2) + observed_weighted
-        else:
-            query = hidden.permute(1, 0, 2)
-        key = route_outputs.permute(1, 0, 2).unsqueeze(1)
-        scores, weighted = self.attn_route(query, key, key, route_attn_mask.unsqueeze(1))  # a = [batch size, src len]
-        prediction_id = scores.squeeze(1).masked_fill(route_attn_mask == 0, 0)
-        weighted = weighted.permute(1, 0, 2)
+        # 历史信息注意力处理（注释掉的功能）
+        if False:  # 历史观测信息处理分支（未启用）
+            observed_emb = observed_emb.unsqueeze(1)  # 增加维度
+            _, observed_weighted = self.observed_attn(hidden.permute(1, 0, 2), observed_emb, observed_emb, observed_mask.unsqueeze(1))  # 历史信息注意力
+            query = hidden.permute(1, 0, 2) + observed_weighted  # 融合历史信息
+        else:  # 当前使用的分支
+            query = hidden.permute(1, 0, 2)  # 使用当前隐藏状态作为查询
+        
+        # 路径注意力计算
+        key = route_outputs.permute(1, 0, 2).unsqueeze(1)  # 路径输出作为键值
+        scores, weighted = self.attn_route(query, key, key, route_attn_mask.unsqueeze(1))  # 计算注意力分数和加权表示
+        prediction_id = scores.squeeze(1).masked_fill(route_attn_mask == 0, 0)  # 应用掩码到预测分数
+        weighted = weighted.permute(1, 0, 2)  # 调整加权表示维度
 
-        # pre_rate
-        if self.rate_flag:
-            rate_input = torch.cat((hidden, weighted), dim=-1).squeeze(0)
-            prediction_rate = self.fc_rate_out(rate_input)
-        else:
-            prediction_rate = torch.ones((prediction_id.shape[0], 1), dtype=torch.float32, device=hidden.device) / 2
+        # 通行率预测
+        if self.rate_flag:  # 如果需要预测通行率
+            rate_input = torch.cat((hidden, weighted), dim=-1).squeeze(0)  # 拼接隐藏状态和注意力加权表示
+            prediction_rate = self.fc_rate_out(rate_input)  # 通过全连接网络预测通行率
+        else:  # 如果不预测通行率
+            prediction_rate = torch.ones((prediction_id.shape[0], 1), dtype=torch.float32, device=hidden.device) / 2  # 使用默认值0.5
 
-        return prediction_id, prediction_rate, hidden
+        return prediction_id, prediction_rate, hidden  # 返回路段ID预测、通行率预测和隐藏状态
 
+    # 前向传播函数
     def forward(self, max_trg_len, batch_size, trg_id, trg_rate, trg_len, hidden, rid_features_dict, routes, route_outputs, route_attn_mask, d_rids, d_rates, teacher_forcing_ratio):
 
-        # tensor to store decoder outputs
-        routes = routes.permute(1, 0)  # [bs, seq len]
-        outputs_id = torch.zeros([max_trg_len, batch_size, routes.shape[1]], device=hidden.device)
-        rate_out_dim = 1
-        outputs_rate = torch.zeros([max_trg_len, batch_size, rate_out_dim], device=hidden.device)
-        # states = torch.zeros([max_trg_len, batch_size, hidden.shape[-1]], device=hidden.device)
-        # states[0] = hidden
+        # 初始化输出张量
+        routes = routes.permute(1, 0)  # 调整路径维度顺序 [bs, seq len]
+        outputs_id = torch.zeros([max_trg_len, batch_size, routes.shape[1]], device=hidden.device)  # 路段ID预测输出张量
+        rate_out_dim = 1  # 通行率输出维度
+        outputs_rate = torch.zeros([max_trg_len, batch_size, rate_out_dim], device=hidden.device)  # 通行率预测输出张量
+        # states = torch.zeros([max_trg_len, batch_size, hidden.shape[-1]], device=hidden.device)  # 状态张量（注释掉）
+        # states[0] = hidden  # 初始状态（注释掉）
 
+        # 时间特征初始化（注释掉）
         # if self.temporal_flag:
         #     src_time_steps = torch.column_stack([torch.zeros(batch_size, device=hidden.device), torch.tensor(trg_len, device=hidden.device) - 1]).long()
+        
+        # 历史信息初始化（注释掉）
         # if self.prev_flag:
         #     observed_ids = trg_id[0, :].unsqueeze(-1)
         #     observed_rates = trg_rate[0, :].unsqueeze(-1)
 
-        # first input to the decoder is the <sos> tokens
-        input_id = trg_id[0, :]
-        input_rate = trg_rate[0, :]
-        for t in range(1, max_trg_len):
-            # decide if we are going to use teacher forcing or not
-            teacher_force = random.random() < teacher_forcing_ratio
+        # 解码器的第一个输入是<sos>标记
+        input_id = trg_id[0, :]  # 初始输入路段ID
+        input_rate = trg_rate[0, :]  # 初始输入通行率
+        
+        # 逐步解码过程
+        for t in range(1, max_trg_len):  # 从第1步开始解码（第0步是<sos>）
+            # 决定是否使用教师强制
+            teacher_force = random.random() < teacher_forcing_ratio  # 随机决定是否使用教师强制
 
-            dt = None
-            observed_emb = None
-            observed_mask = None
+            # 初始化时间和历史信息变量
+            dt = None  # 时间差信息
+            observed_emb = None  # 历史观测嵌入
+            observed_mask = None  # 历史观测掩码
+            
+            # 时间特征处理（注释掉）
             # if self.temporal_flag:
             #     temporal_dist = torch.abs(
             #         torch.tensor(t, device=hidden.device).repeat(batch_size, self.src_len) - src_time_steps)
             #     temporal_dist = torch.where(temporal_dist >= self.max_dist, self.max_dist - 1, temporal_dist)
             #     dt = self.temporal_dist_embedding(temporal_dist).reshape(batch_size, -1)
+            
+            # 历史信息处理（注释掉）
             # if self.prev_flag:
             #     observed_len, _ = torch.min(torch.vstack([torch.tensor(t + 1, device=hidden.device).repeat(batch_size).unsqueeze(0), torch.tensor(trg_len, device=hidden.device).unsqueeze(0)]), dim=0)
             #     observed_mask = torch.ones(batch_size, t + 1, device=hidden.device)
@@ -863,175 +895,174 @@ class DecoderMulti(nn.Module):
             #     observed_emb = torch.cat([self.emb_id[tmp_ids], rid_features_dict[tmp_ids], tmp_rates], dim=-1)
             #     observed_emb = self.observed_mlp(observed_emb)
 
-            # insert input token embedding, previous hidden state, all encoder hidden states
-            #  and attn_mask
-            # receive output tensor (predictions) and new hidden state
+            # 执行单步解码
             prediction_id, prediction_rate, hidden = self.decoding_step(input_id, input_rate, hidden, route_outputs, route_attn_mask, d_rids, d_rates, rid_features_dict, dt, observed_emb, observed_mask)
 
-            if teacher_forcing_ratio == -1 and self.prog_flag:
-                for i in range(batch_size):
-                    if t < trg_len[i]:
-                        prev_idx = (input_id[i] == routes[i]).nonzero(as_tuple=True)[0][0]
-                        tmp_flag = True
-                        while tmp_flag:
-                            cur_idx = prediction_id[i].argmax()
-                            if cur_idx < prev_idx:
-                                prediction_id[i, cur_idx] = 1e-6
-                            else:
-                                tmp_flag = False
+            # 渐进式解码约束处理
+            if teacher_forcing_ratio == -1 and self.prog_flag:  # 如果使用渐进式解码
+                for i in range(batch_size):  # 遍历批次中的每个样本
+                    if t < trg_len[i]:  # 如果当前时间步小于目标长度
+                        prev_idx = (input_id[i] == routes[i]).nonzero(as_tuple=True)[0][0]  # 找到前一个路段在路径中的索引
+                        tmp_flag = True  # 临时标志
+                        while tmp_flag:  # 循环直到找到合适的预测
+                            cur_idx = prediction_id[i].argmax()  # 获取当前预测的最大值索引
+                            if cur_idx < prev_idx:  # 如果预测索引小于前一个索引（违反渐进约束）
+                                prediction_id[i, cur_idx] = 1e-6  # 将该预测设为很小的值
+                            else:  # 如果满足渐进约束
+                                tmp_flag = False  # 退出循环
 
-            # place predictions in a tensor holding predictions for each token
-            outputs_id[t] = prediction_id
-            outputs_rate[t] = prediction_rate
-            # states[t] = hidden
+            # 保存预测结果
+            outputs_id[t] = prediction_id  # 保存路段ID预测
+            outputs_rate[t] = prediction_rate  # 保存通行率预测
+            # states[t] = hidden  # 保存隐藏状态（注释掉）
 
-            # get the highest predicted token from our predictions
-            # make sure the output has the same dimension as input
-            # top1_id = prediction_id.argmax(1).unsqueeze(-1)
+            # 获取预测中概率最高的标记
+            # top1_id = prediction_id.argmax(1).unsqueeze(-1)  # 获取最高概率预测（注释掉）
 
-            # if teacher forcing, use actual next token as next input
-            # if not, use predicted token
-            if teacher_force:
-                input_id = trg_id[t]
-                input_rate = trg_rate[t]
-            else:
-                input_id = (F.one_hot(prediction_id.argmax(dim=1), routes.shape[1]) * routes).sum(-1)
-                input_rate = prediction_rate
+            # 决定下一步的输入：教师强制 vs 模型预测
+            if teacher_force:  # 如果使用教师强制
+                input_id = trg_id[t]  # 使用真实的下一个路段ID
+                input_rate = trg_rate[t]  # 使用真实的下一个通行率
+            else:  # 如果使用模型预测
+                input_id = (F.one_hot(prediction_id.argmax(dim=1), routes.shape[1]) * routes).sum(-1)  # 根据预测选择路段ID
+                input_rate = prediction_rate  # 使用预测的通行率
 
+            # 更新历史信息（注释掉）
             # if self.prev_flag:
             #     observed_ids = torch.cat([observed_ids, input_id.unsqueeze(-1)], dim=1)
             #     observed_rates = torch.cat([observed_rates, input_rate.unsqueeze(-1)], dim=1)
 
-        mask_trg = torch.ones([batch_size, max_trg_len], device=outputs_id.device)
-        mask_trg = sequence_mask(mask_trg, torch.tensor(trg_len, device=outputs_id.device))
-        outputs_rate = outputs_rate.permute(1, 0, 2)  # batch size, seq len, 1
-        outputs_rate = outputs_rate.masked_fill(mask_trg.unsqueeze(-1) == 0, 0)
-        outputs_rate = outputs_rate.permute(1, 0, 2)
-        return outputs_id, outputs_rate
+        # 应用序列长度掩码到输出
+        mask_trg = torch.ones([batch_size, max_trg_len], device=outputs_id.device)  # 创建目标掩码
+        mask_trg = sequence_mask(mask_trg, torch.tensor(trg_len, device=outputs_id.device))  # 应用序列长度掩码
+        outputs_rate = outputs_rate.permute(1, 0, 2)  # 调整通行率输出维度 [batch size, seq len, 1]
+        outputs_rate = outputs_rate.masked_fill(mask_trg.unsqueeze(-1) == 0, 0)  # 应用掩码到通行率输出
+        outputs_rate = outputs_rate.permute(1, 0, 2)  # 恢复原始维度顺序
+        return outputs_id, outputs_rate  # 返回路段ID预测和通行率预测
 
 
-class TrajRecovery(nn.Module):
+class TrajRecovery(nn.Module):  # 轨迹恢复模型类，继承自PyTorch的nn.Module
 
-    def __init__(self, parameters):
-        super().__init__()
-        self.srcseg_flag = parameters.srcseg_flag
-        self.hid_dim = parameters.hid_dim
+    def __init__(self, parameters):  # 初始化函数，接收参数配置
+        super().__init__()  # 调用父类初始化函数
+        self.srcseg_flag = parameters.srcseg_flag  # 是否使用源路段标志
+        self.hid_dim = parameters.hid_dim  # 隐藏层维度
 
-        self.da_route_flag = parameters.da_route_flag
+        self.da_route_flag = parameters.da_route_flag  # 是否使用DA路径标志
 
-        self.learn_pos = parameters.learn_pos
-        self.rid_feats_flag = parameters.rid_feats_flag
+        self.learn_pos = parameters.learn_pos  # 是否学习位置编码标志
+        self.rid_feats_flag = parameters.rid_feats_flag  # 是否使用路段特征标志
 
-        self.params = parameters
+        self.params = parameters  # 保存参数配置
 
-        self.emb_id = nn.Parameter(torch.rand(parameters.id_size, parameters.id_emb_dim))
-        if self.learn_pos:
-            max_input_length = 500
-            self.pos_embedding_gps = nn.Embedding(max_input_length, parameters.hid_dim)
-            self.pos_embedding_route = nn.Embedding(max_input_length, parameters.hid_dim)
-        input_dim_gps = 3
-        if self.learn_pos:
-            input_dim_gps += parameters.hid_dim
-        if self.srcseg_flag:
-            input_dim_gps += parameters.hid_dim + 1
-        self.fc_in_gps = nn.Linear(input_dim_gps, parameters.hid_dim)
-        input_dim_route = parameters.hid_dim
-        if self.learn_pos:
-            input_dim_route += parameters.hid_dim
-        if self.rid_feats_flag:
-            input_dim_route += parameters.rid_fea_dim
-        self.fc_in_route = nn.Linear(input_dim_route, parameters.hid_dim)
+        self.emb_id = nn.Parameter(torch.rand(parameters.id_size, parameters.id_emb_dim))  # 路段ID嵌入参数
+        if self.learn_pos:  # 如果需要学习位置编码
+            max_input_length = 500  # 最大输入长度
+            self.pos_embedding_gps = nn.Embedding(max_input_length, parameters.hid_dim)  # GPS位置嵌入层
+            self.pos_embedding_route = nn.Embedding(max_input_length, parameters.hid_dim)  # 路径位置嵌入层
+        input_dim_gps = 3  # GPS输入维度基础值
+        if self.learn_pos:  # 如果学习位置编码
+            input_dim_gps += parameters.hid_dim  # 增加位置编码维度
+        if self.srcseg_flag:  # 如果使用源路段
+            input_dim_gps += parameters.hid_dim + 1  # 增加路段嵌入和特征维度
+        self.fc_in_gps = nn.Linear(input_dim_gps, parameters.hid_dim)  # GPS输入全连接层
+        input_dim_route = parameters.hid_dim  # 路径输入维度基础值
+        if self.learn_pos:  # 如果学习位置编码
+            input_dim_route += parameters.hid_dim  # 增加位置编码维度
+        if self.rid_feats_flag:  # 如果使用路段特征
+            input_dim_route += parameters.rid_fea_dim  # 增加路段特征维度
+        self.fc_in_route = nn.Linear(input_dim_route, parameters.hid_dim)  # 路径输入全连接层
 
-        if self.da_route_flag:
-            self.encoder = GREncoder(parameters)
-        else:
-            self.encoder = GPSEncoder(parameters)
-        self.decoder = DecoderMulti(parameters)
+        if self.da_route_flag:  # 如果使用DA路径
+            self.encoder = GREncoder(parameters)  # 使用图路径编码器
+        else:  # 否则
+            self.encoder = GPSEncoder(parameters)  # 使用GPS编码器
+        self.decoder = DecoderMulti(parameters)  # 多任务解码器
 
-        self.init_weights()  # learn how to init weights
+        self.init_weights()  # 初始化权重
 
-        self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []
+        self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []  # 计时器列表
 
-    def init_weights(self):
+    def init_weights(self):  # 权重初始化函数
         """
         Here we reproduce Keras default initialization weights for consistency with Keras version
         Reference: https://github.com/vonfeng/DeepMove/blob/master/codes/model.py
         """
-        ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
-        hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
-        b = (param.data for name, param in self.named_parameters() if 'bias' in name)
+        ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)  # 获取输入到隐藏层权重
+        hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)  # 获取隐藏到隐藏层权重
+        b = (param.data for name, param in self.named_parameters() if 'bias' in name)  # 获取偏置参数
 
-        for t in ih:
-            nn.init.xavier_uniform_(t)
-        for t in hh:
-            nn.init.orthogonal_(t)
-        for t in b:
-            nn.init.constant_(t, 0)
+        for t in ih:  # 遍历输入到隐藏层权重
+            nn.init.xavier_uniform_(t)  # 使用Xavier均匀初始化
+        for t in hh:  # 遍历隐藏到隐藏层权重
+            nn.init.orthogonal_(t)  # 使用正交初始化
+        for t in b:  # 遍历偏置参数
+            nn.init.constant_(t, 0)  # 初始化为0
 
-    def forward(self, src, src_len, trg_id, trg_rate, trg_len, pro_features, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):
+    def forward(self, src, src_len, trg_id, trg_rate, trg_len, pro_features, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):  # 前向传播函数
 
-        t0 = time.time()
+        t0 = time.time()  # 记录开始时间
 
-        max_trg_len = trg_id.size(0)
-        batch_size = trg_id.size(1)
+        max_trg_len = trg_id.size(0)  # 目标序列最大长度
+        batch_size = trg_id.size(1)  # 批次大小
 
         # road representation
-        self.decoder.emb_id = self.emb_id  # [id size, hidden dim]
+        self.decoder.emb_id = self.emb_id  # 将路段嵌入传递给解码器
 
-        gps_emb = src.float()
-        if self.learn_pos:
-            gps_pos = src[:, :, -1].long()
-            gps_pos_emb = self.pos_embedding_gps(gps_pos)
-            gps_emb = torch.cat([gps_emb, gps_pos_emb], dim=-1)
-        if self.srcseg_flag:
-            seg_emb = self.emb_id[src_seg_seqs]
-            gps_emb = torch.cat((gps_emb, seg_emb, src_seg_feats), dim=-1)
-        gps_in = self.fc_in_gps(gps_emb)
-        gps_in_lens = torch.tensor(src_len, device=src.device)
+        gps_emb = src.float()  # GPS嵌入，转换为浮点型
+        if self.learn_pos:  # 如果学习位置编码
+            gps_pos = src[:, :, -1].long()  # 获取GPS位置索引
+            gps_pos_emb = self.pos_embedding_gps(gps_pos)  # 获取GPS位置嵌入
+            gps_emb = torch.cat([gps_emb, gps_pos_emb], dim=-1)  # 拼接GPS数据和位置嵌入
+        if self.srcseg_flag:  # 如果使用源路段
+            seg_emb = self.emb_id[src_seg_seqs]  # 获取路段嵌入
+            gps_emb = torch.cat((gps_emb, seg_emb, src_seg_feats), dim=-1)  # 拼接GPS、路段嵌入和路段特征
+        gps_in = self.fc_in_gps(gps_emb)  # 通过全连接层处理GPS输入
+        gps_in_lens = torch.tensor(src_len, device=src.device)  # 源序列长度张量
 
-        self.timer1.append(time.time() - t0)
-        t1 = time.time()
+        self.timer1.append(time.time() - t0)  # 记录第一阶段耗时
+        t1 = time.time()  # 记录时间点1
 
         # encoder_outputs is all hidden states of the input sequence, back and forwards
         # hidden is the final forward and backward hidden states, passed through a linear layer
 
-        if self.da_route_flag:
-            route_emb = self.emb_id[da_routes]
-            if self.learn_pos:
-                route_pos_emb = self.pos_embedding_route(da_pos)
-                route_emb = torch.cat([route_emb, route_pos_emb], dim=-1)
-            if self.rid_feats_flag:
-                route_feats = rid_features_dict[da_routes]
-                route_emb = torch.cat([route_emb, route_feats], dim=-1)
-            route_in = self.fc_in_route(route_emb)
-            route_in_lens = torch.tensor(da_lengths, device=src.device)
+        if self.da_route_flag:  # 如果使用DA路径
+            route_emb = self.emb_id[da_routes]  # 获取路径嵌入
+            if self.learn_pos:  # 如果学习位置编码
+                route_pos_emb = self.pos_embedding_route(da_pos)  # 获取路径位置嵌入
+                route_emb = torch.cat([route_emb, route_pos_emb], dim=-1)  # 拼接路径嵌入和位置嵌入
+            if self.rid_feats_flag:  # 如果使用路段特征
+                route_feats = rid_features_dict[da_routes]  # 获取路径特征
+                route_emb = torch.cat([route_emb, route_feats], dim=-1)  # 拼接路径嵌入和特征
+            route_in = self.fc_in_route(route_emb)  # 通过全连接层处理路径输入
+            route_in_lens = torch.tensor(da_lengths, device=src.device)  # 路径序列长度张量
 
-            self.timer2.append(time.time() - t1)
-            t2 = time.time()
+            self.timer2.append(time.time() - t1)  # 记录第二阶段耗时
+            t2 = time.time()  # 记录时间点2
 
-            route_outputs, hiddens = self.encoder(gps_in, gps_in_lens, route_in, route_in_lens, pro_features)
+            route_outputs, hiddens = self.encoder(gps_in, gps_in_lens, route_in, route_in_lens, pro_features)  # 编码器前向传播
 
-            self.timer3.append(time.time() - t2)
-            t3 = time.time()
-        else:
-            _, hiddens = self.encoder(gps_in, gps_in_lens, pro_features)
-            route_in_lens = torch.tensor(da_lengths, device=src.device)
-            route_outputs = self.emb_id[da_routes]
+            self.timer3.append(time.time() - t2)  # 记录第三阶段耗时
+            t3 = time.time()  # 记录时间点3
+        else:  # 如果不使用DA路径
+            _, hiddens = self.encoder(gps_in, gps_in_lens, pro_features)  # 仅使用GPS编码
+            route_in_lens = torch.tensor(da_lengths, device=src.device)  # 路径序列长度张量
+            route_outputs = self.emb_id[da_routes]  # 直接使用路径嵌入作为输出
 
-        route_attn_mask = torch.ones(batch_size, max(da_lengths), device=src.device)  # only attend on unpadded sequence
-        route_attn_mask = sequence_mask(route_attn_mask, route_in_lens)
+        route_attn_mask = torch.ones(batch_size, max(da_lengths), device=src.device)  # 创建注意力掩码
+        route_attn_mask = sequence_mask(route_attn_mask, route_in_lens)  # 应用序列掩码
 
-        t4 = time.time()
-        self.timer4.append(time.time() - t3)
+        t4 = time.time()  # 记录时间点4
+        self.timer4.append(time.time() - t3)  # 记录第四阶段耗时
 
-        outputs_id, outputs_rate = self.decoder(max_trg_len, batch_size, trg_id, trg_rate, trg_len, hiddens, rid_features_dict, da_routes, route_outputs, route_attn_mask, d_rids, d_rates, teacher_forcing_ratio)
+        outputs_id, outputs_rate = self.decoder(max_trg_len, batch_size, trg_id, trg_rate, trg_len, hiddens, rid_features_dict, da_routes, route_outputs, route_attn_mask, d_rids, d_rates, teacher_forcing_ratio)  # 解码器前向传播
 
-        final_outputs_id = outputs_id[1:-1]
-        final_outputs_rate = outputs_rate[1:-1]
+        final_outputs_id = outputs_id[1:-1]  # 去除开始和结束标记的ID输出
+        final_outputs_rate = outputs_rate[1:-1]  # 去除开始和结束标记的速率输出
 
-        t5 = time.time()
-        self.timer5.append(time.time() - t4)
-        self.timer6.append(t5 - t0)
+        t5 = time.time()  # 记录时间点5
+        self.timer5.append(time.time() - t4)  # 记录第五阶段耗时
+        self.timer6.append(t5 - t0)  # 记录总耗时
 
-        return final_outputs_id, final_outputs_rate
+        return final_outputs_id, final_outputs_rate  # 返回最终的ID和速率输出
 
