@@ -460,8 +460,8 @@ def main():
         logging.info('training dataset shape: ' + str(len(train_dataset)))
         logging.info('validation dataset shape: ' + str(len(valid_dataset)))
 
-        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x), num_workers=opts.num_worker, pin_memory=False)
-        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=8, pin_memory=False)
+        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
+        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=8, pin_memory=False)
 
         model = TestDemo1(args).to(device)
 
@@ -576,7 +576,7 @@ def main():
         print('testing dataset shape: ' + str(len(test_dataset)))
         logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=8, pin_memory=True)
+        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn_test, num_workers=8, pin_memory=True)
 
         model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
         print('==> Model Loaded')

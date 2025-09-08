@@ -15,7 +15,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from models.layers import Attention, GPSFormer, GRFormer, sequence_mask, sequence_mask3d
-from preprocess import SparseDAM, SegInfo
+from preprocess.dam import SparseDAM
+from preprocess.seg_info import SegInfo
 from utils.model_utils import gps2grid, get_normalized_t
 from utils.spatial_func import SPoint, project_pt_to_road, rate2gps
 from utils.trajectory_func import STPoint
