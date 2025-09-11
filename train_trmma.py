@@ -113,6 +113,21 @@ def train(model, iterator, optimizer, rid_features_dict, parameters, device):
     model.train()
     for i, batch in enumerate(iterator):
         t1 = time.time()
+        # 解包batch中的各个字段，含义如下：
+        # src_seqs:         源轨迹的GPS序列（张量，形状为[batch, seq, 3]）
+        # src_pro_feas:     源轨迹的辅助特征（如时间、小时等，张量）
+        # src_seg_seqs:     源轨迹对应的路段序列（张量，形状为[batch, seq]）
+        # src_seg_feats:    源轨迹路段的特征（如通行率等，张量）
+        # src_lengths:      源轨迹每条序列的长度（列表）
+        # trg_rids:         目标轨迹的路段ID序列（张量，形状为[batch, seq]）
+        # trg_rates:        目标轨迹的通行率序列（张量，形状为[batch, seq, 1]）
+        # trg_lengths:      目标轨迹每条序列的长度（列表）
+        # trg_rid_labels:   目标轨迹路段ID的标签（多分类one-hot，张量，形状为[batch, seq, da_len]）
+        # da_routes:        动态规划得到的候选路径（张量，形状为[batch, da_len]）
+        # da_lengths:       每条候选路径的长度（列表）
+        # da_pos:           候选路径的位置信息（张量，形状为[batch, da_len]）
+        # d_rids:           目标轨迹最后一个点的路段ID（张量，形状为[batch, 1]）
+        # d_rates:          目标轨迹最后一个点的通行率（张量，形状为[batch, 1]）
         src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths, trg_rids, trg_rates, trg_lengths, trg_rid_labels, da_routes, da_lengths, da_pos, d_rids, d_rates = batch
 
         src_pro_feas = src_pro_feas.to(device, non_blocking=True)
@@ -280,31 +295,31 @@ def infer(model, iterator, rid_features_dict, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='TRMMA')
-    parser.add_argument('--city', type=str, default='porto')
-    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
-    parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')
-    parser.add_argument('--lambda1', type=int, default=10, help='weight for multi task id')
-    parser.add_argument('--lambda2', type=float, default=5, help='weight for multi task rate')
-    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
-    parser.add_argument('--epochs', type=int, default=30, help='epochs')
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--transformer_layers', type=int, default=2)
-    parser.add_argument('--heads', type=int, default=4)
-    parser.add_argument("--gpu_id", type=str, default="0")
-    parser.add_argument('--model_old_path', type=str, default='', help='old model path')
-    parser.add_argument('--train_flag', action='store_true', help='flag of training')
-    parser.add_argument('--test_flag', action='store_true', help='flag of testing')
-    parser.add_argument('--small', action='store_true')
-    parser.add_argument('--eid_cate', type=str, default='gps2seg')
-    parser.add_argument('--inferred_seg_path', type=str, default='')
-    parser.add_argument('--da_route_flag', action='store_true')
-    parser.add_argument('--srcseg_flag', action='store_true')
-    parser.add_argument('--gps_flag', action='store_true')
-    parser.add_argument('--debug', action='store_true')
-    parser.add_argument('--planner', type=str, default='da')
-    parser.add_argument('--num_worker', type=int, default=8)
+    parser = argparse.ArgumentParser(description='TRMMA')  # 创建命令行参数解析器，描述为TRMMA
+    parser.add_argument('--city', type=str, default='porto')  # 城市名称，字符串类型，默认porto
+    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')  # 保留比例，浮点型，默认0.125
+    parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')  # 教师强制比率，浮点型，默认1
+    parser.add_argument('--lambda1', type=int, default=10, help='weight for multi task id')  # 多任务ID损失权重，整型，默认10
+    parser.add_argument('--lambda2', type=float, default=5, help='weight for multi task rate')  # 多任务rate损失权重，浮点型，默认5
+    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')  # 隐藏层维度，整型，默认256
+    parser.add_argument('--epochs', type=int, default=30, help='epochs')  # 训练轮数，整型，默认30
+    parser.add_argument('--batch_size', type=int, default=4)  # 批次大小，整型，默认4
+    parser.add_argument('--lr', type=float, default=1e-3)  # 学习率，浮点型，默认1e-3
+    parser.add_argument('--transformer_layers', type=int, default=2)  # transformer层数，整型，默认2
+    parser.add_argument('--heads', type=int, default=4)  # 多头注意力头数，整型，默认4
+    parser.add_argument("--gpu_id", type=str, default="0")  # GPU编号，字符串类型，默认0
+    parser.add_argument('--model_old_path', type=str, default='', help='old model path')  # 旧模型路径，字符串类型，默认空
+    parser.add_argument('--train_flag', action='store_true', help='flag of training')  # 训练标志，布尔型，出现则为True
+    parser.add_argument('--test_flag', action='store_true', help='flag of testing')  # 测试标志，布尔型，出现则为True
+    parser.add_argument('--small', action='store_true')  # 是否使用小数据集，布尔型，出现则为True
+    parser.add_argument('--eid_cate', type=str, default='gps2seg')  # eid类别，字符串类型，默认gps2seg
+    parser.add_argument('--inferred_seg_path', type=str, default='')  # 推断分段路径，字符串类型，默认空
+    parser.add_argument('--da_route_flag', action='store_true')  # 是否使用DA路线，布尔型，出现则为True
+    parser.add_argument('--srcseg_flag', action='store_true')  # 是否使用源分段，布尔型，出现则为True
+    parser.add_argument('--gps_flag', action='store_true')  # 是否使用GPS，布尔型，出现则为True
+    parser.add_argument('--debug', action='store_true')  # 调试模式，布尔型，出现则为True
+    parser.add_argument('--planner', type=str, default='da')  # 路径规划器类型，字符串类型，默认da
+    parser.add_argument('--num_worker', type=int, default=8)  # 数据加载线程数，整型，默认8
 
     opts = parser.parse_args()
     print(opts)
@@ -360,70 +375,70 @@ def main():
     map_root = os.path.join("data", opts.city, "roadnet")
     rn = RoadNetworkMapFull(map_root, zone_range=zone_range, unit_length=50)
 
-    args = AttrDict()
-    args_dict = {
-        'device': device,
-        'transformer_layers': opts.transformer_layers,
-        'heads': opts.heads,
-        'tandem_fea_flag': True,
-        'pro_features_flag': True,
-        'srcseg_flag': opts.srcseg_flag,
-        'da_route_flag': opts.da_route_flag,
-        'rate_flag': True,
-        'prog_flag': False,
-        'dest_type': 2,
-        'gps_flag': opts.gps_flag,
-        'rid_feats_flag': True,
-        'learn_pos': True,
+    args = AttrDict()  # 创建参数字典对象
+    args_dict = {  # 定义模型参数字典
+        'device': device,  # 设备类型（CPU或GPU）
+        'transformer_layers': opts.transformer_layers,  # Transformer层数
+        'heads': opts.heads,  # 注意力头数
+        'tandem_fea_flag': True,  # 串联特征标志
+        'pro_features_flag': True,  # 专业特征标志
+        'srcseg_flag': opts.srcseg_flag,  # 源段标志
+        'da_route_flag': opts.da_route_flag,  # DA路由标志
+        'rate_flag': True,  # 速率标志
+        'prog_flag': False,  # 进度标志
+        'dest_type': 2,  # 目标类型
+        'gps_flag': opts.gps_flag,  # GPS标志
+        'rid_feats_flag': True,  # 路段ID特征标志
+        'learn_pos': True,  # 学习位置编码标志
 
-        # constraint
-        'search_dist': 50,
-        'beta': 15,
-        'gamma': 30,
+        # constraint  # 约束参数
+        'search_dist': 50,  # 搜索距离
+        'beta': 15,  # Beta参数
+        'gamma': 30,  # Gamma参数
 
-        # extra info module
-        'rid_fea_dim': 18,  # 1[norm length] + 8[way type] + 1[in degree] + 1[out degree]
-        'pro_input_dim': 48,  # 24[hour] + 1[holiday]
-        'pro_output_dim': 8,
+        # extra info module  # 额外信息模块参数
+        'rid_fea_dim': 18,  # 路段特征维度：1[标准化长度] + 8[道路类型] + 1[入度] + 1[出度]
+        'pro_input_dim': 48,  # 专业输入维度：24[小时] + 1[节假日]
+        'pro_output_dim': 8,  # 专业输出维度
 
-        # MBR
-        'min_lat': zone_range[0],
-        'min_lng': zone_range[1],
-        'max_lat': zone_range[2],
-        'max_lng': zone_range[3],
+        # MBR  # 最小边界矩形参数
+        'min_lat': zone_range[0],  # 最小纬度
+        'min_lng': zone_range[1],  # 最小经度
+        'max_lat': zone_range[2],  # 最大纬度
+        'max_lng': zone_range[3],  # 最大经度
 
-        # input data params
-        'city': opts.city,
-        'keep_ratio': opts.keep_ratio,
-        'grid_size': 50,
-        'time_span': ts,
+        # input data params  # 输入数据参数
+        'city': opts.city,  # 城市名称
+        'keep_ratio': opts.keep_ratio,  # 保留比例
+        'grid_size': 50,  # 网格大小
+        'time_span': ts,  # 时间跨度
 
-        # model params
-        'hid_dim': opts.hid_dim,
-        'id_emb_dim': opts.hid_dim,
-        'dropout': 0.1,
-        'id_size': rn.valid_edge_cnt_one,
+        # model params  # 模型参数
+        'hid_dim': opts.hid_dim,  # 隐藏层维度
+        'id_emb_dim': opts.hid_dim,  # ID嵌入维度
+        'dropout': 0.1,  # Dropout比例
+        'id_size': rn.valid_edge_cnt_one,  # ID大小
 
-        'lambda1': opts.lambda1,
-        'lambda2': opts.lambda2,
-        'n_epochs': opts.epochs,
-        'batch_size': opts.batch_size,
-        'learning_rate': opts.lr,
-        "lr_step": 2,
-        "lr_decay": 0.8,
-        'tf_ratio': opts.tf_ratio,
-        'decay_flag': True,
-        'decay_ratio': 0.9,
-        'clip': 1,
-        'log_step': 1,
+        'lambda1': opts.lambda1,  # Lambda1参数
+        'lambda2': opts.lambda2,  # Lambda2参数
+        'n_epochs': opts.epochs,  # 训练轮数
+        'batch_size': opts.batch_size,  # 批次大小
+        'learning_rate': opts.lr,  # 学习率
+        "lr_step": 2,  # 学习率调整步长
+        "lr_decay": 0.8,  # 学习率衰减率
+        'tf_ratio': opts.tf_ratio,  # Teacher forcing比例
+        'decay_flag': True,  # 衰减标志
+        'decay_ratio': 0.9,  # 衰减比例
+        'clip': 1,  # 梯度裁剪阈值
+        'log_step': 1,  # 日志记录步长
 
-        'utc': utc,
-        'small': opts.small,
-        'dam_root': os.path.join("data", opts.city),
-        'eid_cate': opts.eid_cate,
-        'inferred_seg_path': opts.inferred_seg_path,
-        'planner': opts.planner,
-        'debug': opts.debug,
+        'utc': utc,  # UTC时区偏移
+        'small': opts.small,  # 小数据集标志
+        'dam_root': os.path.join("data", opts.city),  # DAM数据根目录
+        'eid_cate': opts.eid_cate,  # 边ID类别
+        'inferred_seg_path': opts.inferred_seg_path,  # 推断段路径
+        'planner': opts.planner,  # 规划器类型
+        'debug': opts.debug,  # 调试模式标志
     }
     args.update(args_dict)
 

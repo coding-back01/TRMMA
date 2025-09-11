@@ -152,33 +152,33 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
-class Attention(nn.Module):
+class Attention(nn.Module):  # 定义注意力机制的神经网络模块
 
-    def __init__(self, hid_dim):
-        super().__init__()
-        self.hid_dim = hid_dim
+    def __init__(self, hid_dim):  # 初始化方法，传入隐藏层维度
+        super().__init__()  # 调用父类的初始化方法
+        self.hid_dim = hid_dim  # 保存隐藏层维度
 
-        self.attn = nn.Linear(self.hid_dim * 2, self.hid_dim)
-        self.v = nn.Linear(self.hid_dim, 1, bias=False)
+        self.attn = nn.Linear(self.hid_dim * 2, self.hid_dim)  # 定义一个线性层，用于计算注意力能量
+        self.v = nn.Linear(self.hid_dim, 1, bias=False)  # 定义一个线性层，将能量映射为一个分数，不使用偏置
 
-    def forward(self, query, key, value, attn_mask):
-        # query = [bath size, src len, hid dim]
+    def forward(self, query, key, value, attn_mask):  # 前向传播方法，输入query、key、value和注意力mask
+        # query = [batch size, src len, hid dim]
         # key = [batch size, src len, candi num, hid dim]
-        bs, src_len = query.shape[0], query.shape[1]
-        candi_num = key.shape[-2]
-        # repeat decoder hidden sate src_len times
-        query = query.unsqueeze(-2).repeat(1, 1, candi_num, 1)
+        bs, src_len = query.shape[0], query.shape[1]  # 获取batch size和源序列长度
+        candi_num = key.shape[-2]  # 获取候选数量
+        # repeat decoder hidden state src_len times
+        query = query.unsqueeze(-2).repeat(1, 1, candi_num, 1)  # 扩展query维度并在candi_num维度上重复
 
-        energy = torch.tanh(self.attn(torch.cat((query, key), dim=-1)))
+        energy = torch.tanh(self.attn(torch.cat((query, key), dim=-1)))  # 拼接query和key，经过线性层和tanh激活得到能量
 
-        attention = self.v(energy).squeeze(-1)
-        attention = attention.masked_fill(attn_mask == 0, -1e10)
+        attention = self.v(energy).squeeze(-1)  # 将能量通过线性层映射为注意力分数，并去掉最后一维
+        attention = attention.masked_fill(attn_mask == 0, -1e10)  # 使用mask将padding位置的分数设为极小值
         # using mask to force the attention to only be over non-padding elements.
-        scores = F.softmax(attention, dim=-1)
-        weighted = torch.bmm(scores.reshape(bs*src_len, candi_num).unsqueeze(-2), value.reshape(bs*src_len, candi_num, -1)).squeeze(-2)
-        weighted = weighted.reshape(bs, src_len, -1)
+        scores = F.softmax(attention, dim=-1)  # 对注意力分数在最后一维做softmax归一化
+        weighted = torch.bmm(scores.reshape(bs*src_len, candi_num).unsqueeze(-2), value.reshape(bs*src_len, candi_num, -1)).squeeze(-2)  # 计算加权和
+        weighted = weighted.reshape(bs, src_len, -1)  # 恢复加权结果的形状
 
-        return scores, weighted
+        return scores, weighted  # 返回注意力分数和加权结果
 
 
 class GPSLayer(nn.Module):

@@ -43,7 +43,15 @@ def train(model, iterator, optimizer, device):
     epoch_train_id_loss = 0  # 初始化训练损失累计值
     model.train()  # 设置模型为训练模式
     for i, batch in enumerate(iterator):  # 遍历数据迭代器中的每个批次
-        src_seqs, src_lengths, _, candi_labels, candi_ids, candi_feats, candi_masks = batch  # 解包批次数据
+        # 解包批次数据
+        # src_seqs: [batch_size, seq_len, 3]，每条轨迹的GPS序列（经度、纬度、时间）
+        # src_lengths: [batch_size]，每条轨迹的实际长度
+        # _: 真实目标路段ID（此处未用到）
+        # candi_labels: [batch_size, seq_len, candi_num]，每个轨迹点对应的候选路段的one-hot标签
+        # candi_ids: [batch_size, seq_len, candi_num]，每个轨迹点对应的候选路段ID
+        # candi_feats: [batch_size, seq_len, candi_num, feat_dim]，每个候选路段的特征
+        # candi_masks: [batch_size, seq_len, candi_num]，候选路段的有效性掩码（0/1）
+        src_seqs, src_lengths, _, candi_labels, candi_ids, candi_feats, candi_masks = batch
 
         src_seqs = src_seqs.to(device, non_blocking=True)  # 将源序列移动到指定设备（GPU/CPU）
         candi_labels = candi_labels.float().to(device, non_blocking=True)  # 将候选标签转换为浮点数并移动到设备
@@ -131,25 +139,25 @@ def infer(model, iterator, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MMA')
-    parser.add_argument('--city', type=str, default='porto')
-    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
-    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
-    parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--epochs', type=int, default=30, help='epochs')
-    parser.add_argument('--batch_size', type=int, default=4)
-    parser.add_argument('--attn_flag', action='store_true', help='flag of using attention')
-    parser.add_argument('--transformer_layers', type=int, default=2)
-    parser.add_argument("--gpu_id", type=str, default="0")
-    parser.add_argument('--model_old_path', type=str, default='', help='old model path')
-    parser.add_argument('--train_flag', action='store_true', help='flag of training')
-    parser.add_argument('--test_flag', action='store_true', help='flag of testing')
-    parser.add_argument('--small', action='store_true')
-    parser.add_argument('--direction_flag', action='store_true')
-    parser.add_argument("--candi_size", type=int, default=10)
-    parser.add_argument('--num_worker', type=int, default=8)
-    parser.add_argument('--init_ratio', type=float, default=0.5)
-    parser.add_argument('--only_direction', action='store_true')
+    parser = argparse.ArgumentParser(description='MMA')  # 创建命令行参数解析器，描述为'MMA'
+    parser.add_argument('--city', type=str, default='porto')  # 城市名称，默认为'porto'
+    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')  # 保留比例，默认为0.125
+    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')  # 隐藏层维度，默认为256
+    parser.add_argument('--lr', type=float, default=1e-3)  # 学习率，默认为1e-3
+    parser.add_argument('--epochs', type=int, default=30, help='epochs')  # 训练轮数，默认为30
+    parser.add_argument('--batch_size', type=int, default=4)  # 批次大小，默认为4
+    parser.add_argument('--attn_flag', action='store_true', help='flag of using attention')  # 是否使用注意力机制，布尔标志
+    parser.add_argument('--transformer_layers', type=int, default=2)  # transformer层数，默认为2
+    parser.add_argument("--gpu_id", type=str, default="0")  # GPU编号，默认为"0"
+    parser.add_argument('--model_old_path', type=str, default='', help='old model path')  # 旧模型路径，默认为空字符串
+    parser.add_argument('--train_flag', action='store_true', help='flag of training')  # 是否训练，布尔标志
+    parser.add_argument('--test_flag', action='store_true', help='flag of testing')  # 是否测试，布尔标志
+    parser.add_argument('--small', action='store_true')  # 是否使用小数据集，布尔标志
+    parser.add_argument('--direction_flag', action='store_true')  # 是否使用方向特征，布尔标志
+    parser.add_argument("--candi_size", type=int, default=10)  # 候选点数量，默认为10
+    parser.add_argument('--num_worker', type=int, default=8)  # 工作线程数，默认为8
+    parser.add_argument('--init_ratio', type=float, default=0.5)  # 初始化比例，默认为0.5
+    parser.add_argument('--only_direction', action='store_true')  # 是否只用方向特征，布尔标志
 
     opts = parser.parse_args()
     print(opts)
@@ -202,61 +210,57 @@ def main():
         raise NotImplementedError
 
     print('Preparing data...')
-    # 修复 porto 数据集路径映射
-    if opts.city == "porto":
-        map_root = os.path.join("data", "porto_large", "roadnet")
-    else:
-        map_root = os.path.join("data", opts.city, "roadnet")
+    map_root = os.path.join("data", opts.city, "roadnet")
     rn = RoadNetworkMapFull(map_root, zone_range=zone_range, unit_length=50)
 
     args = AttrDict()
-    args_dict = {
-        'device': device,
+    args_dict = {  # 定义模型参数字典
+        'device': device,  # 设备（CPU或GPU）
 
-        'transformer_layers': opts.transformer_layers,
-        'candi_size': opts.candi_size,
+        'transformer_layers': opts.transformer_layers,  # Transformer层数
+        'candi_size': opts.candi_size,  # 候选点数量
         # attention
-        'attn_flag': opts.attn_flag,
-        'direction_flag': opts.direction_flag,
-        'gps_flag': False,
+        'attn_flag': opts.attn_flag,  # 是否使用注意力机制
+        'direction_flag': opts.direction_flag,  # 是否使用方向特征
+        'gps_flag': False,  # 是否使用GPS特征，默认False
 
         # constraint
-        'search_dist': 50,
-        'beta': 15,
-        'gamma': 30,
+        'search_dist': 50,  # 搜索距离，单位米
+        'beta': 15,  # 高斯核参数beta
+        'gamma': 30,  # 高斯核参数gamma
 
         # MBR
-        'min_lat': zone_range[0],
-        'min_lng': zone_range[1],
-        'max_lat': zone_range[2],
-        'max_lng': zone_range[3],
+        'min_lat': zone_range[0],  # 区域最小纬度
+        'min_lng': zone_range[1],  # 区域最小经度
+        'max_lat': zone_range[2],  # 区域最大纬度
+        'max_lng': zone_range[3],  # 区域最大经度
 
         # input data params
-        'city': opts.city,
-        'keep_ratio': opts.keep_ratio,
-        'grid_size': 50,
-        'time_span': ts,
+        'city': opts.city,  # 城市名称
+        'keep_ratio': opts.keep_ratio,  # 保留比例
+        'grid_size': 50,  # 网格大小，单位米
+        'time_span': ts,  # 时间片长度
 
         # model params
-        'hid_dim': opts.hid_dim,
-        'id_emb_dim': opts.hid_dim,
-        'dropout': 0.1,
-        'id_size': rn.valid_edge_cnt_one,
+        'hid_dim': opts.hid_dim,  # 隐藏层维度
+        'id_emb_dim': opts.hid_dim,  # ID嵌入维度
+        'dropout': 0.1,  # dropout比例
+        'id_size': rn.valid_edge_cnt_one,  # 有效边数量
 
-        'n_epochs': opts.epochs,
-        'batch_size': opts.batch_size,
-        'learning_rate': opts.lr,
-        'decay_flag': True,
-        'decay_ratio': 0.9,
-        'clip': 1,
-        'log_step': 1,
+        'n_epochs': opts.epochs,  # 训练轮数
+        'batch_size': opts.batch_size,  # 批大小
+        'learning_rate': opts.lr,  # 学习率
+        'decay_flag': True,  # 是否使用学习率衰减
+        'decay_ratio': 0.9,  # 学习率衰减比例
+        'clip': 1,  # 梯度裁剪阈值
+        'log_step': 1,  # 日志记录步长
 
-        'utc': utc,
-        'small': opts.small,
-        'init_ratio': opts.init_ratio,
-        'only_direction': opts.only_direction,
-        'cate': "g2s",
-        'threshold': 1
+        'utc': utc,  # 时区
+        'small': opts.small,  # 是否使用小数据集
+        'init_ratio': opts.init_ratio,  # 初始化比例
+        'only_direction': opts.only_direction,  # 是否只用方向特征
+        'cate': "g2s",  # 分类类别
+        'threshold': 1  # 阈值
     }
     args.update(args_dict)
 
@@ -267,11 +271,8 @@ def main():
     print(args)
     logging.info(args_dict)
 
-    # 修复 porto 数据集轨迹路径映射
-    if args.city == "porto":
-        traj_root = os.path.join("data", "porto_large")
-    else:
-        traj_root = os.path.join("data", args.city)
+    traj_root = os.path.join("data", args.city)
+    
     if opts.train_flag:
         train_dataset = GPS2SegData(rn, traj_root, mbr, args, 'train')
         valid_dataset = GPS2SegData(rn, traj_root, mbr, args, 'valid')
