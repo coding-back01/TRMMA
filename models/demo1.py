@@ -231,7 +231,7 @@ class GPS2Seg(nn.Module):
         outputs_id = self.prob_out(torch.cat((output_multi, candi_vec), dim=-1)).squeeze(-1)
         outputs_id = outputs_id.masked_fill(candi_masks == 0, 0)
 
-        return outputs_id
+        return output_multi, candi_vec, outputs_id
 
 
 # ==================== TRMMA Model Components ====================
@@ -1115,7 +1115,7 @@ class TrajRecovery(nn.Module):
         for t in b:
             nn.init.constant_(t, 0)
 
-    def forward(self, src, src_len, trg_id, trg_rate, trg_len, pro_features, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):
+    def forward(self, src, src_len, trg_id, trg_rate, trg_len, pro_features, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio, outputs_multi, candi_vec, results):
 
         t0 = time.time()
 
@@ -1178,6 +1178,14 @@ class TrajRecovery(nn.Module):
 
         return final_outputs_id, final_outputs_rate
 
+def get_results(predict_id, target_id, lengths):
+    predict_id = predict_id.detach().cpu().tolist()  # 将预测结果从GPU移动到CPU并转换为Python列表格式
+
+    results = []  # 初始化结果列表，用于存储处理后的预测和目标数据对
+    for pred, trg, length in zip(predict_id, target_id, lengths):  # 遍历每个样本的预测值、目标值和有效长度
+        results.append([pred[:length], trg])  # 截取预测序列的有效部分（根据length），与完整目标序列组成数据对并添加到结果列表
+    return results  # 返回包含所有样本预测-目标数据对的结果列表
+
 
 # ==================== 端到端迭代优化模型 ====================
 
@@ -1227,13 +1235,19 @@ class IterativeModel(nn.Module):
         """
         
         # ===== 第一次MMA：初始地图匹配 =====
-        initial_mma_output = self.mma_model(src_seqs_mma, src_lengths_mma, candi_ids, candi_feats, candi_masks)
+        outputs_multi, candi_vec, output_ids = self.mma_model(src_seqs_mma, src_lengths_mma, candi_ids, candi_feats, candi_masks)
         
+        candi_size = candi_ids.shape[-1]
+        output_tmp = (F.one_hot(output_ids.argmax(-1), candi_size) * candi_ids).sum(dim=-1) - 1
+
+        results = get_results(output_tmp, trg_rids, src_lengths_mma)
+
         # ===== TRMMA：轨迹补齐 =====
         trmma_output_ids, trmma_output_rates = self.trmma_model(
             src_seqs_trmma, src_lengths_trmma, trg_rids, trg_rates, trg_lengths,
             src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos, 
-            src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio
+            src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio,
+            outputs_multi, candi_vec, results
         )
         
         if not training or self.max_iterations <= 1:
@@ -1251,126 +1265,125 @@ class IterativeModel(nn.Module):
         # 从TRMMA输出构造新的轨迹序列用于重新匹配
         
         # 检查必要的依赖是否已设置
-        if self.rn is None:
-            raise ValueError("Road network (rn) must be set before calling forward. Use set_road_network() method.")
-        if self.seg_info is None:
-            raise ValueError("Segment info must be set before calling forward. Use set_road_network() method.")
+        if self.rn is None:  # 检查路网对象是否已设置
+            raise ValueError("Road network (rn) must be set before calling forward. Use set_road_network() method.")  # 抛出错误提示需要设置路网
+        if self.seg_info is None:  # 检查路段信息是否已设置
+            raise ValueError("Segment info must be set before calling forward. Use set_road_network() method.")  # 抛出错误提示需要设置路段信息
         
-        # 获取TRMMA预测的路段ID序列（使用原作者的逻辑）
+        # 获取TRMMA预测的路段ID序列
         # 基于get_results函数中的路段提取逻辑
-        import torch.nn.functional as F
-        predicted_seg_ids = []
+        import torch.nn.functional as F  # 导入函数式接口用于one-hot编码
+        predicted_seg_ids = []  # 初始化预测路段ID列表
         
         # 将TRMMA输出转换为路段ID
-        output_tmp = (F.one_hot(trmma_output_ids.argmax(-1), da_routes.shape[0]) * 
-                     da_routes.permute(1, 0).unsqueeze(1).repeat(1, trmma_output_ids.shape[0], 1).permute(1, 0, 2)).sum(dim=-1)
+        output_tmp = (F.one_hot(trmma_output_ids.argmax(-1), da_routes.shape[0]) *   # 对预测ID进行one-hot编码
+                     da_routes.permute(1, 0).unsqueeze(1).repeat(1, trmma_output_ids.shape[0], 1).permute(1, 0, 2)).sum(dim=-1)  # 与路线矩阵相乘得到实际路段ID
         
         # 转换为列表格式，每个批次一个序列
-        output_tmp = output_tmp.permute(1, 0).detach().cpu().tolist()  # [batch_size, seq_len]
+        output_tmp = output_tmp.permute(1, 0).detach()  # 转换维度顺序并分离梯度 [batch_size, seq_len]
         
-        for b, pred_seg in enumerate(output_tmp):
-            if b < len(da_lengths):
-                length = da_lengths[b] if hasattr(da_lengths, '__len__') else len(pred_seg)
-                predicted_seg_ids.append(torch.tensor(pred_seg[:length]))
+        for b, pred_seg in enumerate(output_tmp):  # 遍历每个批次的预测路段
+            if b < len(da_lengths):  # 检查批次索引是否在有效范围内
+                length = da_lengths[b] if hasattr(da_lengths, '__len__') else len(pred_seg)  # 获取当前批次的序列长度
+                predicted_seg_ids.append(pred_seg[:length])  # 截取有效长度的路段ID
         
-        # 将预测的路段序列转换为GPS坐标（使用原作者的toseq函数）
-        from utils.evaluation_utils import toseq
-        reconstructed_gps_list = []
-        for b, seg_ids in enumerate(predicted_seg_ids):
-            if b < len(da_lengths):
-                route_len = da_lengths[b]
-                route = da_routes[:route_len, b].cpu().numpy()
-                rates = trmma_output_rates[:len(seg_ids), b].cpu().numpy() if b < trmma_output_rates.shape[1] else [0.5] * len(seg_ids)
+        # 将预测的路段序列转换为GPS坐标
+        from utils.evaluation_utils import toseq  # 导入路段到GPS序列转换函数
+        reconstructed_gps_list = []  # 初始化重构GPS坐标列表
+        for b, seg_ids in enumerate(predicted_seg_ids):  # 遍历每个批次的预测路段ID
+            if b < len(da_lengths):  # 检查批次索引是否在有效范围内
+                route_len = da_lengths[b]  # 获取当前批次的路线长度
+                route = da_routes[:route_len, b]  # 获取当前批次的路线
+                rates = trmma_output_rates[:len(seg_ids), b] if b < trmma_output_rates.shape[1] else torch.full((len(seg_ids),), 0.5, device=seg_ids.device)  # 获取通行率，如果不存在则使用默认值0.5
                 # 使用toseq函数转换路段和通行率为GPS坐标
-                gps_seq = toseq(self.rn, seg_ids.cpu().numpy(), rates, route, self.seg_info)
-                reconstructed_gps_list.append(gps_seq)
+                gps_seq = toseq(self.rn, seg_ids.cpu().numpy(), rates.cpu().numpy(), route.cpu().numpy(), self.seg_info)  # 调用转换函数生成GPS序列，只在必要时转换为CPU
+                reconstructed_gps_list.append(gps_seq)  # 将生成的GPS序列添加到列表中
         
         # 转换为tensor格式
-        batch_size, max_seq_len, _ = src_seqs_mma.shape
-        device = trmma_output_rates.device
-        reconstructed_gps = torch.zeros(batch_size, max_seq_len, 3, device=device)
-        for b, gps_seq in enumerate(reconstructed_gps_list):
-            seq_len = min(len(gps_seq), max_seq_len)
-            for t in range(seq_len):
-                if t < len(gps_seq):
-                    reconstructed_gps[b, t, 0] = gps_seq[t][0]  # 纬度
-                    reconstructed_gps[b, t, 1] = gps_seq[t][1]  # 经度
-                    reconstructed_gps[b, t, 2] = t * 0.1  # 时间特征
+        batch_size, max_seq_len, _ = src_seqs_mma.shape  # 获取批次大小和最大序列长度
+        device = trmma_output_rates.device  # 获取设备信息
+        reconstructed_gps = torch.zeros(batch_size, max_seq_len, 3, device=device)  # 初始化重构GPS张量，3维表示纬度、经度、时间
+        for b, gps_seq in enumerate(reconstructed_gps_list):  # 遍历每个批次的GPS序列
+            seq_len = min(len(gps_seq), max_seq_len)  # 获取实际序列长度，不超过最大长度
+            for t in range(seq_len):  # 遍历序列中的每个时间步
+                if t < len(gps_seq):  # 检查时间步是否在有效范围内
+                    reconstructed_gps[b, t, 0] = gps_seq[t][0]  # 设置纬度
+                    reconstructed_gps[b, t, 1] = gps_seq[t][1]  # 设置经度
+                    reconstructed_gps[b, t, 2] = t * 0.1  # 设置时间特征，使用线性增长
         
-        # 为重构的GPS序列生成新的候选路段（使用原作者的get_trg_segs函数）
-        new_candi_ids_list = []
-        new_candi_feats_list = []
-        new_candi_masks_list = []
+        # 为重构的GPS序列生成新的候选路段
+        new_candi_ids_list = []  # 初始化新候选路段ID列表
+        new_candi_feats_list = []  # 初始化新候选路段特征列表
+        new_candi_masks_list = []  # 初始化新候选路段掩码列表
         
-        for b, gps_seq in enumerate(reconstructed_gps_list):
+        for b, gps_seq in enumerate(reconstructed_gps_list):  # 遍历每个批次的重构GPS序列
             # 转换候选路段为所需格式
-            batch_candi_ids = []
-            batch_candi_feats = []
-            batch_candi_masks = []
+            batch_candi_ids = []  # 初始化当前批次的候选路段ID
+            batch_candi_feats = []  # 初始化当前批次的候选路段特征
+            batch_candi_masks = []  # 初始化当前批次的候选路段掩码
             
-            if len(gps_seq) > 0:
+            if len(gps_seq) > 0:  # 检查GPS序列是否非空
                 # 使用路网的get_trg_segs函数生成候选路段
-                trg_candis = self.rn.get_trg_segs(gps_seq, candi_ids.shape[-1], 
-                                                 self.mma_args.search_dist, self.mma_args.beta)
+                trg_candis = self.rn.get_trg_segs(gps_seq, candi_ids.shape[-1],   # 调用路网函数获取目标候选路段
+                                                 self.mma_args.search_dist, self.mma_args.beta)  # 使用搜索距离和beta参数
                 
-                for candis in trg_candis:
-                    candi_ids_seq = []
-                    candi_feats_seq = []
-                    candi_mask_seq = []
+                for candis in trg_candis:  # 遍历每个时间步的候选路段
+                    candi_ids_seq = []  # 初始化当前时间步的候选路段ID
+                    candi_feats_seq = []  # 初始化当前时间步的候选路段特征
+                    candi_mask_seq = []  # 初始化当前时间步的候选路段掩码
                     
-                    if candis:
-                        for candi in candis[:candi_ids.shape[-1]]:
-                            candi_ids_seq.append(candi.eid + 1)  # +1 避免0索引
+                    if candis:  # 检查候选路段是否存在
+                        for candi in candis[:candi_ids.shape[-1]]:  # 遍历候选路段，不超过最大候选数量
+                            candi_ids_seq.append(candi.eid + 1)  # 添加候选路段ID，+1避免0索引
                             # 使用候选路段的特征 - 按照原作者的9维特征格式
-                            candi_feats_seq.append([
-                                getattr(candi, 'err_weight', candi.error),  # 误差权重
-                                getattr(candi, 'cosv', 0.0),      # cosv
-                                getattr(candi, 'cosv_pre', 0.0),  # cosv_pre  
-                                getattr(candi, 'cosf', 0.0),      # cosf
-                                getattr(candi, 'cosl', 0.0),      # cosl
-                                getattr(candi, 'cos1', 0.0),      # cos1
-                                getattr(candi, 'cos2', 0.0),      # cos2
-                                getattr(candi, 'cos3', 0.0),      # cos3
-                                getattr(candi, 'cosp', 0.0)       # cosp
+                            candi_feats_seq.append([  # 构建9维特征向量
+                                getattr(candi, 'err_weight', candi.error),  # 误差权重，如果不存在则使用error
+                                getattr(candi, 'cosv', 0.0),      # cosv特征，默认0.0
+                                getattr(candi, 'cosv_pre', 0.0),  # cosv_pre特征，默认0.0
+                                getattr(candi, 'cosf', 0.0),      # cosf特征，默认0.0
+                                getattr(candi, 'cosl', 0.0),      # cosl特征，默认0.0
+                                getattr(candi, 'cos1', 0.0),      # cos1特征，默认0.0
+                                getattr(candi, 'cos2', 0.0),      # cos2特征，默认0.0
+                                getattr(candi, 'cos3', 0.0),      # cos3特征，默认0.0
+                                getattr(candi, 'cosp', 0.0)       # cosp特征，默认0.0
                             ])
-                            candi_mask_seq.append(1.0)
+                            candi_mask_seq.append(1.0)  # 设置有效候选路段的掩码为1.0
                     
                     # 填充到固定长度
-                    while len(candi_ids_seq) < candi_ids.shape[-1]:
-                        candi_ids_seq.append(0)
-                        candi_feats_seq.append([0.0] * 9)
-                        candi_mask_seq.append(0.0)
+                    while len(candi_ids_seq) < candi_ids.shape[-1]:  # 当候选路段数量不足时进行填充
+                        candi_ids_seq.append(0)  # 填充无效ID为0
+                        candi_feats_seq.append([0.0] * 9)  # 填充无效特征为全0向量
+                        candi_mask_seq.append(0.0)  # 填充无效掩码为0.0
                     
-                    batch_candi_ids.append(candi_ids_seq[:candi_ids.shape[-1]])
-                    batch_candi_feats.append(candi_feats_seq[:candi_ids.shape[-1]])
-                    batch_candi_masks.append(candi_mask_seq[:candi_ids.shape[-1]])
-            else:
+                    batch_candi_ids.append(candi_ids_seq[:candi_ids.shape[-1]])  # 截取到指定长度并添加到批次列表
+                    batch_candi_feats.append(candi_feats_seq[:candi_ids.shape[-1]])  # 截取到指定长度并添加到批次列表
+                    batch_candi_masks.append(candi_mask_seq[:candi_ids.shape[-1]])  # 截取到指定长度并添加到批次列表
+            else:  # 如果GPS序列为空
                 # 如果没有GPS序列，创建空的候选路段
-                seq_len = src_lengths_mma[b] if b < len(src_lengths_mma) else max_seq_len
-                for t in range(seq_len):
-                    batch_candi_ids.append([0] * candi_ids.shape[-1])
-                    batch_candi_feats.append([[0.0] * 9 for _ in range(candi_ids.shape[-1])])
-                    batch_candi_masks.append([0.0] * candi_ids.shape[-1])
+                seq_len = src_lengths_mma[b] if b < len(src_lengths_mma) else max_seq_len  # 获取序列长度
+                for t in range(seq_len):  # 遍历每个时间步
+                    batch_candi_ids.append([0] * candi_ids.shape[-1])  # 添加全0的候选路段ID
+                    batch_candi_feats.append([[0.0] * 9 for _ in range(candi_ids.shape[-1])])  # 添加全0的候选路段特征
+                    batch_candi_masks.append([0.0] * candi_ids.shape[-1])  # 添加全0的候选路段掩码
             
-            new_candi_ids_list.append(batch_candi_ids)
-            new_candi_feats_list.append(batch_candi_feats)
-            new_candi_masks_list.append(batch_candi_masks)
+            new_candi_ids_list.append(batch_candi_ids)  # 将当前批次的候选路段ID添加到总列表
+            new_candi_feats_list.append(batch_candi_feats)  # 将当前批次的候选路段特征添加到总列表
+            new_candi_masks_list.append(batch_candi_masks)  # 将当前批次的候选路段掩码添加到总列表
         
         # 转换为tensor格式
-        device = candi_ids.device
-        batch_size, max_seq_len, candi_size = candi_ids.shape
-        new_candi_ids = torch.zeros(batch_size, max_seq_len, candi_size, dtype=torch.long, device=device)
-        new_candi_feats = torch.zeros(batch_size, max_seq_len, candi_size, 9, device=device)
-        new_candi_masks = torch.zeros(batch_size, max_seq_len, candi_size, device=device)
+        device = candi_ids.device  # 获取设备信息
+        batch_size, max_seq_len, candi_size = candi_ids.shape  # 获取批次大小、最大序列长度和候选路段数量
+        new_candi_ids = torch.zeros(batch_size, max_seq_len, candi_size, dtype=torch.long, device=device)  # 初始化新候选路段ID张量
+        new_candi_feats = torch.zeros(batch_size, max_seq_len, candi_size, 9, device=device)  # 初始化新候选路段特征张量，9维特征
+        new_candi_masks = torch.zeros(batch_size, max_seq_len, candi_size, device=device)  # 初始化新候选路段掩码张量
         
-        for b, (ids, feats, masks) in enumerate(zip(new_candi_ids_list, new_candi_feats_list, new_candi_masks_list)):
-            seq_len = min(len(ids), max_seq_len)
-            for t in range(seq_len):
-                if t < len(ids):
-                    new_candi_ids[b, t] = torch.tensor(ids[t], device=device)
-                    new_candi_feats[b, t] = torch.tensor(feats[t], device=device)
-                    new_candi_masks[b, t] = torch.tensor(masks[t], device=device)
-        
+        for b, (ids, feats, masks) in enumerate(zip(new_candi_ids_list, new_candi_feats_list, new_candi_masks_list)):  # 遍历每个批次的候选路段数据
+            seq_len = min(len(ids), max_seq_len)  # 获取实际序列长度，不超过最大长度
+            for t in range(seq_len):  # 遍历序列中的每个时间步
+                if t < len(ids):  # 检查时间步是否在有效范围内
+                    new_candi_ids[b, t] = torch.tensor(ids[t], device=device)  # 设置候选路段ID张量
+                    new_candi_feats[b, t] = torch.tensor(feats[t], device=device)  # 设置候选路段特征张量
+                    new_candi_masks[b, t] = torch.tensor(masks[t], device=device)  # 设置候选路段掩码张量
         # ===== 第二次MMA：重新地图匹配 =====
         refined_mma_output = self.mma_model(
             reconstructed_gps, src_lengths_mma, new_candi_ids, new_candi_feats, new_candi_masks

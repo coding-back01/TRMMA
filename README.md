@@ -127,7 +127,7 @@ python -u infer_mma.py --city porto1 --keep_ratio 0.1 --attn_flag --hid_dim 64 -
 ### 2. TRMMA model training and inference examples
 To train TRMMA model on Porto dataset, run the following command:
 ```bash
-python -u train_trmma.py --city porto1 --keep_ratio 0.1 --da_route_flag --gps_flag --hid_dim 64 --transformer_layers 4 --lambda1 10 --lambda2 5 --tf_ratio 1 --gpu_id 0 --epochs 50 --batch_size 256 --train_flag
+python -u train_trmma.py --city porto --keep_ratio 0.1 --da_route_flag --gps_flag --hid_dim 64 --transformer_layers 4 --lambda1 10 --lambda2 5 --tf_ratio 1 --gpu_id 0 --epochs 50 --batch_size 256 --train_flag
 ```
 - city: the city name, choices are porto, xian, beijing and chengdu.
 - keep_ratio: control the level of trajectory sparsity, from 0.1 to 0.5.

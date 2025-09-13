@@ -147,7 +147,7 @@ def train(model, iterator, optimizer, rid_features_dict, parameters, device):
         t2 = time.time()
 
         output_ids, output_rates = model(src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
-                                                        src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio)
+                                                        src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos, None, None, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio)
 
         time_forward += time.time() - t2
         t3 = time.time()

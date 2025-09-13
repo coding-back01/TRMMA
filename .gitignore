@@ -161,3 +161,11 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #.idea/
 /data
+/.idea/.gitignore
+/model/TRMMA/porto/TR_porto_keep-ratio_0.1_20250912_110545/tensorboard/events.out.tfevents.1757646436.back.19688.0
+/model/TRMMA/porto/TR_porto_keep-ratio_0.1_20250912_110545/log.txt
+/.idea/misc.xml
+/.idea/modules.xml
+/.idea/inspectionProfiles/profiles_settings.xml
+/.idea/TRMMA.iml
+/.idea/vcs.xml

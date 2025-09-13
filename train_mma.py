@@ -103,12 +103,12 @@ def evaluate(model, iterator, device):
 
 
 def get_results(predict_id, target_id, lengths):
-    predict_id = predict_id.detach().cpu().tolist()
+    predict_id = predict_id.detach().cpu().tolist()  # 将预测结果从GPU移动到CPU并转换为Python列表格式
 
-    results = []
-    for pred, trg, length in zip(predict_id, target_id, lengths):
-        results.append([pred[:length], trg])
-    return results
+    results = []  # 初始化结果列表，用于存储处理后的预测和目标数据对
+    for pred, trg, length in zip(predict_id, target_id, lengths):  # 遍历每个样本的预测值、目标值和有效长度
+        results.append([pred[:length], trg])  # 截取预测序列的有效部分（根据length），与完整目标序列组成数据对并添加到结果列表
+    return results  # 返回包含所有样本预测-目标数据对的结果列表
 
 
 def infer(model, iterator, device):
@@ -117,6 +117,14 @@ def infer(model, iterator, device):
     model.eval()
     with torch.no_grad():
         for i, batch in enumerate(iterator):
+            # 从批次数据中解包各种输入数据：
+            # src_seqs: 源GPS序列数据，包含轨迹的GPS坐标点
+            # src_lengths: 每个轨迹序列的实际长度
+            # trg_rids: 目标路段ID序列，即真实的地图匹配结果
+            # _: 占位符，表示该位置的数据在推理阶段不需要使用
+            # candi_ids: 候选路段ID，每个GPS点对应的候选路段集合
+            # candi_feats: 候选路段特征，包含路段的各种属性信息
+            # candi_masks: 候选路段掩码，用于标识有效的候选路段
             src_seqs, src_lengths, trg_rids, _, candi_ids, candi_feats, candi_masks = batch
 
             src_seqs = src_seqs.to(device, non_blocking=True)

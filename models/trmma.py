@@ -1023,8 +1023,8 @@ class TrajRecovery(nn.Module):  # 轨迹恢复模型类，继承自PyTorch的nn.
         self.timer1.append(time.time() - t0)  # 记录第一阶段耗时
         t1 = time.time()  # 记录时间点1
 
-        # encoder_outputs is all hidden states of the input sequence, back and forwards
-        # hidden is the final forward and backward hidden states, passed through a linear layer
+        # encoder_outputs 是输入序列的所有隐藏状态，包括前向和后向
+        # hidden 是最终的前向和后向隐藏状态，通过线性层处理
 
         if self.da_route_flag:  # 如果使用DA路径
             route_emb = self.emb_id[da_routes]  # 获取路径嵌入
