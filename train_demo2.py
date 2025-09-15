@@ -526,7 +526,7 @@ def main():
         for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
             start_time = time.time()
 
-            print("==> training {}, {}...".format(args.tf_ratio, lr))
+            print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(train_dataset.keep_ratio, args.tf_ratio, lr))
             t_train = time.time()
             train_loss, train_mma, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
             end_train = time.time()
@@ -569,12 +569,15 @@ def main():
 
             if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
                 logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
-                logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio))
+                logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(train_dataset.keep_ratio))
                 logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
                 logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
                 torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
             if args.decay_flag:
                 args.tf_ratio = args.tf_ratio * args.decay_ratio
+                # 与 MMA 保持一致：keep_ratio 每轮按 decay_ratio 衰减，但不低于 keep_ratio 下限
+                train_dataset.keep_ratio = max(args.keep_ratio, train_dataset.keep_ratio * args.decay_ratio)
+                print("==> decay keep_ratio to {} (clamped by {})".format(train_dataset.keep_ratio, args.keep_ratio))
 
             scheduler.step(valid_id)
             lr_last = lr

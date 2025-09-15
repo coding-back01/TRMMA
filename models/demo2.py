@@ -31,6 +31,9 @@ class E2ETrajData(Dataset):
         self.time_span = parameters.time_span
         self.mode = mode
         self.keep_ratio = parameters.keep_ratio
+        if mode == 'train':
+            # 训练阶段从 init_ratio 开始，便于后续按 decay_ratio 衰减到 keep_ratio
+            self.keep_ratio = getattr(parameters, 'init_ratio', parameters.keep_ratio)
 
         if mode == 'train':
             file = os.path.join(trajs_dir, 'train.pkl')
