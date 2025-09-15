@@ -162,8 +162,7 @@ cython_debug/
 #.idea/
 /data
 /.idea/.gitignore
-/model/TRMMA/porto/TR_porto_keep-ratio_0.1_20250912_110545/tensorboard/events.out.tfevents.1757646436.back.19688.0
-/model/TRMMA/porto/TR_porto_keep-ratio_0.1_20250912_110545/log.txt
+/model
 /.idea/misc.xml
 /.idea/modules.xml
 /.idea/inspectionProfiles/profiles_settings.xml

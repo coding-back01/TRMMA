@@ -333,7 +333,7 @@ def main():
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     torch.backends.cudnn.deterministic = True
-    print('multi_task device', device)
+    print('device', device)
 
     load_pretrained_flag = False
     if opts.model_old_path != '':
@@ -465,7 +465,7 @@ def main():
         logging.info('validation dataset shape: ' + str(len(valid_dataset)))
 
         train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn(x), num_workers=opts.num_worker, pin_memory=False)
-        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=8, pin_memory=False)
+        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=opts.num_worker, pin_memory=False)
 
         model = TrajRecovery(args).to(device)
 
@@ -581,7 +581,7 @@ def main():
         print('testing dataset shape: ' + str(len(test_dataset)))
         logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=8, pin_memory=True)
+        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=opts.num_worker, pin_memory=True)
 
         model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
         print('==> Model Loaded')

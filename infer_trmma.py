@@ -60,14 +60,14 @@ def main():
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     torch.backends.cudnn.deterministic = True
-    print('multi_task device', device)
+    print('device', device)
 
     load_pretrained_flag = False
     if opts.model_old_path != '':
         model_save_path = opts.model_old_path
         load_pretrained_flag = True
     else:
-        raise "model path error"
+        raise ValueError("model path error - must provide model_old_path for inference")
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s',
@@ -182,7 +182,7 @@ def main():
         print('testing dataset shape: ' + str(len(test_dataset)))
         logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=8, pin_memory=True)
+        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=opts.num_worker, pin_memory=True)
 
         model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
         print('==> Model Loaded')

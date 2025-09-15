@@ -1,9 +1,9 @@
 import os
 import pickle
 import random
-import time
 
 import numpy as np
+import time
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -45,6 +45,27 @@ class E2ETrajData(Dataset):
             num_k = len(trajs) // num_group
             trajs = trajs[num_k * idx_group: num_k * (idx_group + 1)]
         self.trajs = trajs
+
+        # 为与 TRMMA 的最终输出一致：在非 train 模式下，预先构建 groups 与 src_mms
+        self.groups = []
+        self.src_mms = []
+        if self.mode != 'train':
+            for serial, traj in enumerate(self.trajs):
+                low_idx = traj.low_idx
+                src_list = np.array(traj.pt_list, dtype=object)
+                src_list = src_list[low_idx].tolist()
+
+                # 低频观测点的匹配结果 (gps, seg, rate)
+                src_mm = []
+                for pt in src_list:
+                    candi_pt = pt.data['candi_pt']
+                    src_mm.append([[candi_pt.lat, candi_pt.lng], candi_pt.eid, candi_pt.rate])
+                self.src_mms.append(src_mm)
+
+                # 记录该轨迹的 gap 数量（每个 gap 对应一个样本）
+                for p1_idx, p2_idx in zip(low_idx[:-1], low_idx[1:]):
+                    if (p1_idx + 1) < p2_idx:
+                        self.groups.append(serial)
 
     def __len__(self):
         return len(self.trajs)
@@ -280,6 +301,21 @@ class GPS2Seg(nn.Module):
 
         self.params = parameters
         self.hid_dim = parameters.hid_dim
+
+        # 与 MMA 保持一致的权重初始化
+        self.init_weights()
+
+    def init_weights(self):
+        ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
+        hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
+        b = (param.data for name, param in self.named_parameters() if 'bias' in name)
+
+        for t in ih:
+            nn.init.xavier_uniform_(t)
+        for t in hh:
+            nn.init.orthogonal_(t)
+        for t in b:
+            nn.init.constant_(t, 0)
 
     def forward(self, src, src_len, candi_ids, candi_feats, candi_masks):
         candi_num = candi_ids.shape[-1]
@@ -529,7 +565,33 @@ class TrajRecoveryE2E(nn.Module):
             self.encoder = GPSEncoder(parameters)
         self.decoder = DecoderMulti(parameters)
 
+        # forward 内阶段计时（与 TRMMA 对齐）
+        self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []
+
+        # 权重初始化（与 MMA/TRMMA 保持一致）
+        self.init_weights()
+
+    def init_weights(self):
+        """
+        与 MMA/TRMMA 相同的权重初始化策略：
+        - RNN 的 weight_ih 用 Xavier 均匀
+        - RNN 的 weight_hh 用正交
+        - bias 全部置 0
+        """
+        ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
+        hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
+        b = (param.data for name, param in self.named_parameters() if 'bias' in name)
+
+        for t in ih:
+            nn.init.xavier_uniform_(t)
+        for t in hh:
+            nn.init.orthogonal_(t)
+        for t in b:
+            nn.init.constant_(t, 0)
+
     def forward(self, src, src_len, trg_id, trg_rate, trg_len, pro_features, rid_features_dict, da_routes, da_lengths, da_pos, src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio, soft_seg_emb):
+        t0 = time.time()
+
         max_trg_len = trg_id.size(0)
         batch_size = trg_id.size(1)
 
@@ -548,6 +610,9 @@ class TrajRecoveryE2E(nn.Module):
         gps_in = self.fc_in_gps(gps_emb)
         gps_in_lens = torch.tensor(src_len, device=src.device)
 
+        self.timer1.append(time.time() - t0)
+        t1 = time.time()
+
         if self.da_route_flag:
             route_emb = self.emb_id[da_routes]
             if self.learn_pos:
@@ -558,7 +623,11 @@ class TrajRecoveryE2E(nn.Module):
                 route_emb = torch.cat([route_emb, route_feats], dim=-1)
             route_in = self.fc_in_route(route_emb)
             route_in_lens = torch.tensor(da_lengths, device=src.device)
+            self.timer2.append(time.time() - t1)
+            t2 = time.time()
             route_outputs, hiddens = self.encoder(gps_in, gps_in_lens, route_in, route_in_lens, pro_features)
+            self.timer3.append(time.time() - t2)
+            t3 = time.time()
         else:
             _, hiddens = self.encoder(gps_in, gps_in_lens, pro_features)
             route_in_lens = torch.tensor(da_lengths, device=src.device)
@@ -567,10 +636,14 @@ class TrajRecoveryE2E(nn.Module):
         route_attn_mask = torch.ones(batch_size, max(da_lengths), device=src.device)
         route_attn_mask = sequence_mask(route_attn_mask, route_in_lens)
 
+        self.timer4.append(time.time() - (t3 if self.da_route_flag else t1))
+        t4 = time.time()
         outputs_id, outputs_rate = self.decoder(max_trg_len, batch_size, trg_id, trg_rate, trg_len, hiddens, rid_features_dict, da_routes, route_outputs, route_attn_mask, d_rids, d_rates, teacher_forcing_ratio)
 
         final_outputs_id = outputs_id[1:-1]
         final_outputs_rate = outputs_rate[1:-1]
+        self.timer5.append(time.time() - t4)
+        self.timer6.append(time.time() - t0)
         return final_outputs_id, final_outputs_rate
 
 
@@ -615,61 +688,6 @@ class End2EndModel(nn.Module):
             'out_ids': out_ids,      # [trg_len-2, bs, da_len]
             'out_rates': out_rates   # [trg_len-2, bs, 1]
         }
-
-
-# ==================== 批处理打包（collate） ====================
-
-def collate_fn_e2e(batch):
-    """
-    将 E2ETrajData 返回的 list[list[...]] 展平成样本列表，并打包为批张量。
-    返回顺序遵循 TRMMA 训练脚本，再追加 MMA 字段，便于使用现有训练范式。
-    """
-    data = []
-    for item in batch:
-        data.extend(item)
-
-    # 解包（TRMMA部分）
-    da_routes, src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, trg_rids, trg_rates, \
-    trg_rid_labels, d_rids, d_rates, candi_onehots, candi_ids, candi_feats, candi_masks = zip(*data)
-
-    # TRMMA 打包
-    src_lengths = [len(seq) for seq in src_seqs]
-    src_seqs = rnn_utils.pad_sequence(src_seqs, batch_first=True, padding_value=0)
-    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1)
-    src_seg_seqs = rnn_utils.pad_sequence(src_seg_seqs, batch_first=True, padding_value=0)
-    src_seg_feats = rnn_utils.pad_sequence(src_seg_feats, batch_first=True, padding_value=0)
-    trg_lengths = [len(seq) for seq in trg_rids]
-    trg_rids = rnn_utils.pad_sequence(trg_rids, batch_first=True, padding_value=0)
-    trg_rates = rnn_utils.pad_sequence(trg_rates, batch_first=True, padding_value=0)
-
-    da_lengths = [len(seq) for seq in da_routes]
-    da_routes = rnn_utils.pad_sequence(da_routes, batch_first=True, padding_value=0)
-    da_pos = [torch.tensor(list(range(1, item + 1))) for item in da_lengths]
-    da_pos = rnn_utils.pad_sequence(da_pos, batch_first=True, padding_value=0)
-    d_rids = torch.vstack(d_rids).squeeze(-1)
-    d_rates = torch.vstack(d_rates)
-    max_da = max(da_lengths)
-    trg_rid_labels = list(trg_rid_labels)
-    for i in range(len(trg_rid_labels)):
-        if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
-            trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
-
-    # MMA 打包（只对两个端点，seq_len=2）
-    candi_onehots = rnn_utils.pad_sequence(candi_onehots, batch_first=True, padding_value=0)
-    candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
-    candi_feats = rnn_utils.pad_sequence(candi_feats, batch_first=True, padding_value=0)
-    candi_masks = rnn_utils.pad_sequence(candi_masks, batch_first=True, padding_value=0)
-
-    return (
-        # TRMMA
-        src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths,
-        trg_rids, trg_rates, trg_lengths, trg_rid_labels,
-        da_routes, da_lengths, da_pos, d_rids, d_rates,
-        # MMA
-        candi_onehots, candi_ids, candi_feats, candi_masks
-    )
 
 
 # ==================== 损失函数（联合） ====================

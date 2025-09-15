@@ -10,16 +10,61 @@ import argparse
 
 import torch
 from torch.utils.data import DataLoader
+import torch.nn.utils.rnn as rnn_utils
 import torch.nn.functional as F
 import torch.optim as optim
 from utils.map import RoadNetworkMapFull
 from utils.spatial_func import SPoint
 from utils.mbr import MBR
-from models.demo2 import E2ETrajData, End2EndModel, E2ELoss, collate_fn_e2e
+from models.demo2 import E2ETrajData, End2EndModel, E2ELoss
 from models.trmma import DAPlanner
 from utils.model_utils import AttrDict, gps2grid
 from tqdm import tqdm
 import numpy as np
+
+
+def collate_fn(batch):
+    data = []
+    for item in batch:
+        data.extend(item)
+
+    da_routes, src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, trg_rids, trg_rates, \
+    trg_rid_labels, d_rids, d_rates, candi_labels, candi_ids, candi_feats, candi_masks = zip(*data)
+
+    src_lengths = [len(seq) for seq in src_seqs]
+    src_seqs = rnn_utils.pad_sequence(src_seqs, batch_first=True, padding_value=0)
+    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1)
+    src_seg_seqs = rnn_utils.pad_sequence(src_seg_seqs, batch_first=True, padding_value=0)
+    src_seg_feats = rnn_utils.pad_sequence(src_seg_feats, batch_first=True, padding_value=0)
+    trg_lengths = [len(seq) for seq in trg_rids]
+    trg_rids = rnn_utils.pad_sequence(trg_rids, batch_first=True, padding_value=0)
+    trg_rates = rnn_utils.pad_sequence(trg_rates, batch_first=True, padding_value=0)
+
+    da_lengths = [len(seq) for seq in da_routes]
+    da_routes = rnn_utils.pad_sequence(da_routes, batch_first=True, padding_value=0)
+    da_pos = [torch.tensor(list(range(1, item + 1))) for item in da_lengths]
+    da_pos = rnn_utils.pad_sequence(da_pos, batch_first=True, padding_value=0)
+    d_rids = torch.vstack(d_rids).squeeze(-1)
+    d_rates = torch.vstack(d_rates)
+    max_da = max(da_lengths)
+    trg_rid_labels = list(trg_rid_labels)
+    for i in range(len(trg_rid_labels)):
+        if trg_rid_labels[i].shape[1] < max_da:
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
+            trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
+
+    candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
+    candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
+    candi_feats = rnn_utils.pad_sequence(candi_feats, batch_first=True, padding_value=0)
+    candi_masks = rnn_utils.pad_sequence(candi_masks, batch_first=True, padding_value=0)
+
+    return (
+        src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths,
+        trg_rids, trg_rates, trg_lengths, trg_rid_labels,
+        da_routes, da_lengths, da_pos, d_rids, d_rates,
+        candi_labels, candi_ids, candi_feats, candi_masks
+    )
 
 
 def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, device):
@@ -28,8 +73,20 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
     epoch_id_loss = 0
     epoch_rate_loss = 0
 
+    time_ttl = 0
+    time_move = 0
+    time_forward = 0
+    time_loss = 0
+    time_zero = 0
+    time_gradient = 0
+    time_update = 0
+    time_ttl2 = 0
+
+    t0 = time.time()
+
     model.train()
     for i, batch in enumerate(iterator):
+        t1 = time.time()
         # 解包 batch
         src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths, \
         trg_rids, trg_rates, trg_lengths, trg_rid_labels, \
@@ -49,15 +106,15 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         src_seqs_tr = mma_src_seqs.permute(1, 0, 2)  # [src_len, bs, 3]
         trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
         trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
-
+        src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
+        src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
         da_routes = da_routes.permute(1, 0).to(device, non_blocking=True)
         da_pos = da_pos.permute(1, 0).to(device, non_blocking=True)
         d_rids = d_rids.to(device, non_blocking=True)
         d_rates = d_rates.to(device, non_blocking=True)
 
-        # 源路段信息（若启用 srcseg_flag）
-        src_seg_seqs_dev = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
-        src_seg_feats_dev = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
+        time_move += time.time() - t1
+        t2 = time.time()
 
         outputs = model(
             # MMA
@@ -65,8 +122,11 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
             # TRMMA
             src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
             src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
-            src_seg_seqs_dev, src_seg_feats_dev, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio
+            src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio
         )
+
+        time_forward += time.time() - t2
+        t3 = time.time()
 
         labels = {
             'mma_onehot': candi_onehots.to(device, non_blocking=True),
@@ -80,9 +140,17 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
 
         ttl_loss, loss_dict = criterion(outputs, labels, lengths)
 
+        time_loss += time.time() - t3
+        t4 = time.time()
+
         optimizer.zero_grad(set_to_none=True)
+        time_zero += time.time() - t4
+        t5 = time.time()
         ttl_loss.backward()
+        time_gradient += time.time() - t5
+        t6 = time.time()
         optimizer.step()
+        time_update += time.time() - t6
 
         epoch_ttl_loss += ttl_loss.item()
         epoch_mma_loss += loss_dict['mma']
@@ -91,7 +159,11 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
 
         if len(iterator) >= 10 and (i + 1) % (len(iterator) // 10) == 0:
             print("==>{}: {}, {}, {}, {}".format((i + 1) // (len(iterator) // 10), epoch_ttl_loss / (i + 1), epoch_mma_loss / (i + 1), epoch_id_loss / (i + 1), epoch_rate_loss / (i + 1)))
+        time_ttl2 += time.time() - t1
 
+    time_ttl += time.time() - t0
+    # print(time_ttl, time_ttl - time_ttl2, time_move, time_forward, time_loss, time_zero, time_gradient, time_update)
+    # print(np.sum(model.trmma.timer6), np.sum(model.trmma.timer1), np.sum(model.trmma.timer2), np.sum(model.trmma.timer3), np.sum(model.trmma.timer4), np.sum(model.trmma.timer5))
     return epoch_ttl_loss / len(iterator), epoch_mma_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
 
 
@@ -126,14 +198,14 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
             d_rids = d_rids.to(device, non_blocking=True)
             d_rates = d_rates.to(device, non_blocking=True)
 
-            src_seg_seqs_dev = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
-            src_seg_feats_dev = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
+            src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
+            src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
 
             outputs = model(
                 mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
                 src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
                 src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
-                src_seg_seqs_dev, src_seg_feats_dev, d_rids, d_rates, teacher_forcing_ratio=0
+                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=0
             )
 
             labels = {
@@ -158,6 +230,96 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
     return epoch_ttl_loss / len(iterator), epoch_mma_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
 
 
+def get_results(predict_id, predict_rate, target_id, target_rate, trg_len, routes, route_lengths):
+    """
+    统一与 TRMMA 的推理输出风格，但不依赖 trg_gps：
+    返回 [pred_seg, pred_rate, trg_id, trg_rate, route]。
+    """
+    predict_id = predict_id.permute(1, 0).detach().cpu().tolist()
+    predict_rate = predict_rate.permute(1, 0).detach().cpu().tolist()
+    target_id = target_id.permute(1, 0).detach().cpu().tolist()
+    target_rate = target_rate.permute(1, 0).detach().cpu().tolist()
+    routes = routes.permute(1, 0).detach().cpu().tolist()
+
+    results = []
+    for pred_seg, pred_rate, trg_id, trg_rate, length, route, route_len in zip(
+            predict_id, predict_rate, target_id, target_rate, trg_len, routes, route_lengths):
+        results.append([
+            pred_seg[:length], pred_rate[:length],
+            trg_id[:length], trg_rate[:length],
+            route[:route_len]
+        ])
+    return results
+
+
+def infer(model, iterator, rid_features_dict, device):
+    data = []
+
+    model.eval()
+    with torch.no_grad():
+        for i, batch in enumerate(iterator):
+            src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths, \
+            trg_rids, trg_rates, trg_lengths, trg_rid_labels, \
+            da_routes, da_lengths, da_pos, d_rids, d_rates, \
+            candi_onehots, candi_ids, candi_feats, candi_masks = batch
+
+            # MMA inputs
+            mma_src_seqs = src_seqs.to(device, non_blocking=True)
+            mma_src_lens = src_lengths
+            mma_candi_ids = candi_ids.to(device, non_blocking=True)
+            mma_candi_feats = candi_feats.to(device, non_blocking=True)
+            mma_candi_masks = candi_masks.to(device, non_blocking=True)
+
+            # TRMMA inputs
+            src_pro_feas = src_pro_feas.to(device, non_blocking=True)
+            trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
+            src_seqs_tr = mma_src_seqs.permute(1, 0, 2)
+            trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
+            trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
+
+            da_routes = da_routes.permute(1, 0).to(device, non_blocking=True)
+            da_pos = da_pos.permute(1, 0).to(device, non_blocking=True)
+            d_rids = d_rids.to(device, non_blocking=True)
+            d_rates = d_rates.to(device, non_blocking=True)
+
+            src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
+            src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
+
+            outputs = model(
+                # MMA
+                mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
+                # TRMMA
+                src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
+                src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
+                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=-1
+            )
+
+            out_ids = outputs['out_ids']
+            out_rates = outputs['out_rates']
+
+            # 将 route 索引映射为实际 eid
+            routes_bs_len = da_routes.permute(1, 0)  # [bs, da_len]
+            T = out_ids.shape[0]
+            onehot = F.one_hot(out_ids.argmax(-1), da_routes.shape[0])  # [T, bs, da_len]
+            expanded_routes = routes_bs_len.unsqueeze(1).repeat(1, T, 1).permute(1, 0, 2)
+            output_tmp = (onehot * expanded_routes).sum(dim=-1)  # [T, bs]
+
+            output_rates = out_rates.squeeze(2)
+            gt_rates = trg_rates.squeeze(2)
+            trg_lengths_sub = [length - 2 for length in trg_lengths]
+
+            results = get_results(
+                output_tmp, output_rates, trg_rids[1:-1], gt_rates[1:-1],
+                trg_lengths_sub, da_routes, da_lengths
+            )
+            data.extend(results)
+
+            if len(iterator) >= 10 and (i + 1) % (len(iterator) // 10) == 0:
+                print("==> Test: {}".format((i + 1) // (len(iterator) // 10)))
+
+    return data
+
+
 def main():
     parser = argparse.ArgumentParser(description='E2E MMA+TRMMA')
     parser.add_argument('--city', type=str, default='porto')
@@ -173,6 +335,7 @@ def main():
     parser.add_argument('--transformer_layers', type=int, default=2)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
+    parser.add_argument('--model_old_path', type=str, default='', help='old model path')
     parser.add_argument('--train_flag', action='store_true', help='flag of training')
     parser.add_argument('--small', action='store_true')
     parser.add_argument('--direction_flag', action='store_true')
@@ -198,12 +361,17 @@ def main():
     torch.manual_seed(SEED)
     torch.cuda.manual_seed(SEED)
     torch.backends.cudnn.deterministic = True
-    print('e2e device', device)
-
-    model_save_root = f'./model/TRMMA/{opts.city}/'
-    model_save_path = model_save_root + 'E2E_' + opts.city + '_' + 'keep-ratio_' + str(opts.keep_ratio) + '_' + time.strftime("%Y%m%d_%H%M%S") + '/'
-    if not os.path.exists(model_save_path):
-        os.makedirs(model_save_path)
+    print('device', device)
+    
+    load_pretrained_flag = False
+    if opts.model_old_path != '':
+        model_save_path = opts.model_old_path
+        load_pretrained_flag = True
+    else:
+        model_save_root = f'./model/TRMMA/{opts.city}/'
+        model_save_path = model_save_root + 'E2E_' + opts.city + '_' + 'keep-ratio_' + str(opts.keep_ratio) + '_' + time.strftime("%Y%m%d_%H%M%S") + '/'
+        if not os.path.exists(model_save_path):
+            os.makedirs(model_save_path)
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s',
@@ -285,6 +453,8 @@ def main():
         'n_epochs': opts.epochs,
         'batch_size': opts.batch_size,
         'learning_rate': opts.lr,
+        'lr_step': 2,
+        'lr_decay': 0.8,
         'tf_ratio': opts.tf_ratio,
         'decay_flag': True,
         'decay_ratio': 0.9,
@@ -324,29 +494,35 @@ def main():
         logging.info('training dataset shape: ' + str(len(train_dataset)))
         logging.info('validation dataset shape: ' + str(len(valid_dataset)))
 
-        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda x: collate_fn_e2e(x), num_workers=opts.num_worker, pin_memory=False)
-        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_e2e(x), num_workers=8, pin_memory=False)
+        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
+        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
 
         # 将同一份参数用于两侧子模型，确保嵌入维度、id_size 等一致
         mma_args = args
         trmma_args = args
         model = End2EndModel(mma_args, trmma_args).to(device)
 
+        if load_pretrained_flag:
+            model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
+
         print('model', str(model))
         logging.info('model' + str(model))
 
         tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
 
-        lr = args.learning_rate
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=2, factor=0.8, threshold=1e-3)
-        criterion = E2ELoss(lambda_mma=opts.lambda_mma, lambda_id=args.lambda1, lambda_rate=args.lambda2)
-
         best_valid_loss = float('inf')
         best_epoch = 0
+
+        ls_train_loss, ls_train_mma_loss, ls_train_id_loss, ls_train_rate_loss = [], [], [], []
+        ls_valid_loss, ls_valid_mma_loss, ls_valid_id_loss, ls_valid_rate_loss = [], [], [], []
+
+        lr = args.learning_rate
+        optimizer = optim.AdamW(model.parameters(), lr=lr)
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_step, factor=args.lr_decay, threshold=1e-3)
+        criterion = E2ELoss(lambda_mma=opts.lambda_mma, lambda_id=args.lambda1, lambda_rate=args.lambda2)
+
         stopping_count = 0
         train_times = []
-
         for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
             start_time = time.time()
 
@@ -356,16 +532,20 @@ def main():
             end_train = time.time()
             print("training: {}".format(end_train - t_train))
 
+            ls_train_loss.append(train_loss)
+            ls_train_mma_loss.append(train_mma)
+            ls_train_id_loss.append(train_id)
+            ls_train_rate_loss.append(train_rate)
+
             print("==> validating...")
             t_valid = time.time()
             valid_loss, valid_mma, valid_id, valid_rate = evaluate(model, valid_iterator, criterion, rid_features_dict, args, device)
             print("validating: {}".format(time.time() - t_valid))
 
-            tb_writer.add_scalars('Loss_total', {'Train': train_loss, 'Valid': valid_loss}, epoch)
-            tb_writer.add_scalars('Loss_mma', {'Train': train_mma, 'Valid': valid_mma}, epoch)
-            tb_writer.add_scalars('Loss_id', {'Train': train_id, 'Valid': valid_id}, epoch)
-            tb_writer.add_scalars('Loss_rate', {'Train': train_rate, 'Valid': valid_rate}, epoch)
-            tb_writer.add_scalar('learning_rate', lr, epoch)
+            ls_valid_loss.append(valid_loss)
+            ls_valid_mma_loss.append(valid_mma)
+            ls_valid_id_loss.append(valid_id)
+            ls_valid_rate_loss.append(valid_rate)
 
             end_time = time.time()
             epoch_secs = end_time - start_time
@@ -379,16 +559,24 @@ def main():
             else:
                 stopping_count += 1
 
-            logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
-            logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio))
-            logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
-            logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
+            tb_writer.add_scalars('Train_loss', {'total': train_loss, 'RID': train_id, 'Rate': train_rate, 'MMA': train_mma}, epoch)
+            tb_writer.add_scalars('Valid_loss', {'total': valid_loss, 'RID': valid_id, 'Rate': valid_rate, 'MMA': valid_mma}, epoch)
+            tb_writer.add_scalar('learning_rate', lr, epoch)
+            tb_writer.add_scalars('TTL_loss', {'Train': train_loss, 'Valid': valid_loss}, epoch)
+            tb_writer.add_scalars('Seg_loss', {'Train': train_id, 'Valid': valid_id}, epoch)
+            tb_writer.add_scalars('Rate_loss', {'Train': train_rate, 'Valid': valid_rate}, epoch)
+            tb_writer.add_scalars('MMA_loss', {'Train': train_mma, 'Valid': valid_mma}, epoch)
 
-            torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
+            if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
+                logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
+                logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio))
+                logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
+                logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
+                torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
             if args.decay_flag:
                 args.tf_ratio = args.tf_ratio * args.decay_ratio
 
-            scheduler.step(valid_loss)
+            scheduler.step(valid_id)
             lr_last = lr
             lr = optimizer.param_groups[0]['lr']
 
@@ -408,5 +596,6 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
