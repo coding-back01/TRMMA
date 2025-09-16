@@ -1,5 +1,6 @@
 import torch.nn as nn
 from torch.utils.tensorboard import SummaryWriter
+from utils.evaluation_utils import calc_metrics, toseq
 
 import random
 import time
@@ -7,6 +8,7 @@ import logging
 
 import os
 import argparse
+import pickle
 
 import torch
 from torch.utils.data import DataLoader
@@ -20,6 +22,7 @@ from models.demo2 import E2ETrajData, End2EndModel, E2ELoss
 from models.trmma import DAPlanner
 from utils.model_utils import AttrDict, gps2grid
 from tqdm import tqdm
+from collections import Counter
 import numpy as np
 
 
@@ -336,7 +339,6 @@ def main():
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
-    parser.add_argument('--train_flag', action='store_true', help='flag of training')
     parser.add_argument('--small', action='store_true')
     parser.add_argument('--direction_flag', action='store_true')
     parser.add_argument('--attn_flag', action='store_true')
@@ -363,15 +365,10 @@ def main():
     torch.backends.cudnn.deterministic = True
     print('device', device)
     
-    load_pretrained_flag = False
-    if opts.model_old_path != '':
-        model_save_path = opts.model_old_path
-        load_pretrained_flag = True
-    else:
-        model_save_root = f'./model/TRMMA/{opts.city}/'
-        model_save_path = model_save_root + 'E2E_' + opts.city + '_' + 'keep-ratio_' + str(opts.keep_ratio) + '_' + time.strftime("%Y%m%d_%H%M%S") + '/'
-        if not os.path.exists(model_save_path):
-            os.makedirs(model_save_path)
+    model_save_root = f'./model/TRMMA/{opts.city}/'
+    model_save_path = model_save_root + 'E2E_' + opts.city + '_' + 'keep-ratio_' + str(opts.keep_ratio) + '_' + time.strftime("%Y%m%d_%H%M%S") + '/'
+    if not os.path.exists(model_save_path):
+        os.makedirs(model_save_path)
 
     logging.basicConfig(level=logging.DEBUG,
                         format='%(asctime)s %(levelname)s %(message)s',
@@ -485,117 +482,206 @@ def main():
 
     traj_root = os.path.join("data", args.city)
 
-    if opts.train_flag:
-        train_dataset = E2ETrajData(rn, traj_root, mbr, args, 'train')
-        valid_dataset = E2ETrajData(rn, traj_root, mbr, args, 'valid')
-        print('training dataset shape: ' + str(len(train_dataset)))
-        print('validation dataset shape: ' + str(len(valid_dataset)))
-        logging.info('Finish data preparing.')
-        logging.info('training dataset shape: ' + str(len(train_dataset)))
-        logging.info('validation dataset shape: ' + str(len(valid_dataset)))
+    # ===== 固定流程：训练 -> 验证 -> 测试 =====
+    train_dataset = E2ETrajData(rn, traj_root, mbr, args, 'train')
+    valid_dataset = E2ETrajData(rn, traj_root, mbr, args, 'valid')
+    print('training dataset shape: ' + str(len(train_dataset)))
+    print('validation dataset shape: ' + str(len(valid_dataset)))
+    logging.info('Finish data preparing.')
+    logging.info('training dataset shape: ' + str(len(train_dataset)))
+    logging.info('validation dataset shape: ' + str(len(valid_dataset)))
 
-        train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
-        valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
+    train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
+    valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
 
-        # 将同一份参数用于两侧子模型，确保嵌入维度、id_size 等一致
-        mma_args = args
-        trmma_args = args
-        model = End2EndModel(mma_args, trmma_args).to(device)
+    # 将同一份参数用于两侧子模型，确保嵌入维度、id_size 等一致
+    mma_args = args
+    trmma_args = args
+    model = End2EndModel(mma_args, trmma_args).to(device)
 
-        if load_pretrained_flag:
-            model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
+    print('model', str(model))
+    logging.info('model' + str(model))
 
-        print('model', str(model))
-        logging.info('model' + str(model))
+    tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
 
-        tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
+    best_valid_loss = float('inf')
+    best_epoch = 0
 
-        best_valid_loss = float('inf')
-        best_epoch = 0
+    ls_train_loss, ls_train_mma_loss, ls_train_id_loss, ls_train_rate_loss = [], [], [], []
+    ls_valid_loss, ls_valid_mma_loss, ls_valid_id_loss, ls_valid_rate_loss = [], [], [], []
 
-        ls_train_loss, ls_train_mma_loss, ls_train_id_loss, ls_train_rate_loss = [], [], [], []
-        ls_valid_loss, ls_valid_mma_loss, ls_valid_id_loss, ls_valid_rate_loss = [], [], [], []
+    lr = args.learning_rate
+    optimizer = optim.AdamW(model.parameters(), lr=lr)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_step, factor=args.lr_decay, threshold=1e-3)
+    criterion = E2ELoss(lambda_mma=opts.lambda_mma, lambda_id=args.lambda1, lambda_rate=args.lambda2)
 
-        lr = args.learning_rate
-        optimizer = optim.AdamW(model.parameters(), lr=lr)
-        scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_step, factor=args.lr_decay, threshold=1e-3)
-        criterion = E2ELoss(lambda_mma=opts.lambda_mma, lambda_id=args.lambda1, lambda_rate=args.lambda2)
+    stopping_count = 0
+    train_times = []
+    for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
+        start_time = time.time()
 
-        stopping_count = 0
-        train_times = []
-        for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
-            start_time = time.time()
+        print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(train_dataset.keep_ratio, args.tf_ratio, lr))
+        t_train = time.time()
+        train_loss, train_mma, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
+        end_train = time.time()
+        print("training: {}".format(end_train - t_train))
 
-            print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(train_dataset.keep_ratio, args.tf_ratio, lr))
-            t_train = time.time()
-            train_loss, train_mma, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
-            end_train = time.time()
-            print("training: {}".format(end_train - t_train))
+        ls_train_loss.append(train_loss)
+        ls_train_mma_loss.append(train_mma)
+        ls_train_id_loss.append(train_id)
+        ls_train_rate_loss.append(train_rate)
 
-            ls_train_loss.append(train_loss)
-            ls_train_mma_loss.append(train_mma)
-            ls_train_id_loss.append(train_id)
-            ls_train_rate_loss.append(train_rate)
+        print("==> validating...")
+        t_valid = time.time()
+        valid_loss, valid_mma, valid_id, valid_rate = evaluate(model, valid_iterator, criterion, rid_features_dict, args, device)
+        print("validating: {}".format(time.time() - t_valid))
 
-            print("==> validating...")
-            t_valid = time.time()
-            valid_loss, valid_mma, valid_id, valid_rate = evaluate(model, valid_iterator, criterion, rid_features_dict, args, device)
-            print("validating: {}".format(time.time() - t_valid))
+        ls_valid_loss.append(valid_loss)
+        ls_valid_mma_loss.append(valid_mma)
+        ls_valid_id_loss.append(valid_id)
+        ls_valid_rate_loss.append(valid_rate)
 
-            ls_valid_loss.append(valid_loss)
-            ls_valid_mma_loss.append(valid_mma)
-            ls_valid_id_loss.append(valid_id)
-            ls_valid_rate_loss.append(valid_rate)
+        end_time = time.time()
+        epoch_secs = end_time - start_time
+        train_times.append(end_train - t_train)
 
-            end_time = time.time()
-            epoch_secs = end_time - start_time
-            train_times.append(end_train - t_train)
+        if valid_loss < best_valid_loss:
+            best_valid_loss = valid_loss
+            torch.save(model, os.path.join(model_save_path, 'val-best-model.pt'))
+            best_epoch = epoch
+            stopping_count = 0
+        else:
+            stopping_count += 1
 
-            if valid_loss < best_valid_loss:
-                best_valid_loss = valid_loss
-                torch.save(model, os.path.join(model_save_path, 'val-best-model.pt'))
-                best_epoch = epoch
-                stopping_count = 0
-            else:
-                stopping_count += 1
+        tb_writer.add_scalars('Train_loss', {'total': train_loss, 'RID': train_id, 'Rate': train_rate, 'MMA': train_mma}, epoch)
+        tb_writer.add_scalars('Valid_loss', {'total': valid_loss, 'RID': valid_id, 'Rate': valid_rate, 'MMA': valid_mma}, epoch)
+        tb_writer.add_scalar('learning_rate', lr, epoch)
+        tb_writer.add_scalars('TTL_loss', {'Train': train_loss, 'Valid': valid_loss}, epoch)
+        tb_writer.add_scalars('Seg_loss', {'Train': train_id, 'Valid': valid_id}, epoch)
+        tb_writer.add_scalars('Rate_loss', {'Train': train_rate, 'Valid': valid_rate}, epoch)
+        tb_writer.add_scalars('MMA_loss', {'Train': train_mma, 'Valid': valid_mma}, epoch)
 
-            tb_writer.add_scalars('Train_loss', {'total': train_loss, 'RID': train_id, 'Rate': train_rate, 'MMA': train_mma}, epoch)
-            tb_writer.add_scalars('Valid_loss', {'total': valid_loss, 'RID': valid_id, 'Rate': valid_rate, 'MMA': valid_mma}, epoch)
-            tb_writer.add_scalar('learning_rate', lr, epoch)
-            tb_writer.add_scalars('TTL_loss', {'Train': train_loss, 'Valid': valid_loss}, epoch)
-            tb_writer.add_scalars('Seg_loss', {'Train': train_id, 'Valid': valid_id}, epoch)
-            tb_writer.add_scalars('Rate_loss', {'Train': train_rate, 'Valid': valid_rate}, epoch)
-            tb_writer.add_scalars('MMA_loss', {'Train': train_mma, 'Valid': valid_mma}, epoch)
+        if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
+            logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
+            logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(train_dataset.keep_ratio))
+            logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
+            logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
+            torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
+        if args.decay_flag:
+            args.tf_ratio = args.tf_ratio * args.decay_ratio
+            # 与 MMA 保持一致：keep_ratio 每轮按 decay_ratio 衰减，但不低于 keep_ratio 下限
+            train_dataset.keep_ratio = max(args.keep_ratio, train_dataset.keep_ratio * args.decay_ratio)
+            print("==> decay keep_ratio to {} (clamped by {})".format(train_dataset.keep_ratio, args.keep_ratio))
 
-            if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
-                logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
-                logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(train_dataset.keep_ratio))
-                logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
-                logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
-                torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
-            if args.decay_flag:
-                args.tf_ratio = args.tf_ratio * args.decay_ratio
-                # 与 MMA 保持一致：keep_ratio 每轮按 decay_ratio 衰减，但不低于 keep_ratio 下限
-                train_dataset.keep_ratio = max(args.keep_ratio, train_dataset.keep_ratio * args.decay_ratio)
-                print("==> decay keep_ratio to {} (clamped by {})".format(train_dataset.keep_ratio, args.keep_ratio))
+        scheduler.step(valid_id)
+        lr_last = lr
+        lr = optimizer.param_groups[0]['lr']
 
-            scheduler.step(valid_id)
-            lr_last = lr
-            lr = optimizer.param_groups[0]['lr']
+        if lr <= 0.9 * 1e-5:
+            print("==> [Info] Early Stop since lr is too small After Epoch {}.".format(epoch))
+            break
+        if stopping_count >= 5:
+            print("==> [Info] Early Stop After Epoch {}.".format(epoch))
+            break
 
-            if lr <= 0.9 * 1e-5:
-                print("==> [Info] Early Stop since lr is too small After Epoch {}.".format(epoch))
-                break
-            if stopping_count >= 5:
-                print("==> [Info] Early Stop After Epoch {}.".format(epoch))
-                break
+    tb_writer.close()
+    logging.info('Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
+    print('==> Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
+    logging.info('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
+    print('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
 
-        tb_writer.close()
-        logging.info('Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
-        print('==> Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
-        logging.info('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
-        print('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
+    # ===== 测试阶段 =====
+    test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
+    print('testing dataset shape: ' + str(len(test_dataset)))
+    logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
+    test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=True)
+
+    # 加载验证集最佳权重进行测试
+    model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
+    print('==> Model Loaded')
+
+    print('==> Starting Prediction...')
+    start_time = time.time()
+    data = infer(model, test_iterator, rid_features_dict, device)
+    end_time = time.time()
+    epoch_secs = end_time - start_time
+    print('Time: ' + str(epoch_secs) + 's')
+    logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
+    print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
+    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
+
+    # Gap-level metrics (same as infer_demo2)
+    outputs = []
+    for pred_seg, pred_rate, trg_id, trg_rate, route in data:
+        pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
+        trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
+        outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
+
+    print('==> Starting Evaluation...')
+    epoch_id1_loss = []
+    epoch_recall_loss = []
+    epoch_precision_loss = []
+    epoch_f1_loss = []
+    epoch_mae_loss = []
+    epoch_rmse_loss = []
+    for pred_gps, pred_seg, trg_gps, trg_id in outputs:
+        recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
+        epoch_id1_loss.append(loss_ids1)
+        epoch_recall_loss.append(recall)
+        epoch_precision_loss.append(precision)
+        epoch_f1_loss.append(f1)
+        epoch_mae_loss.append(loss_mae)
+        epoch_rmse_loss.append(loss_rmse)
+
+    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
+    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
+    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
+    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
+    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
+    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
+    print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
+    logging.info('Time: ' + str(epoch_secs) + 's')
+    logging.info('\tTest RID Acc:' + str(test_id_acc) +
+                 '\tTest RID Recall:' + str(test_id_recall) +
+                 '\tTest RID Precision:' + str(test_id_precision) +
+                 '\tTest RID F1 Score:' + str(test_id_f1) +
+                 '\tTest MAE Loss:' + str(test_mae) +
+                 '\tTest RMSE Loss:' + str(test_rmse))
+
+    # Reconstruct full trajectory outputs for visualization/sharing
+    test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
+    groups = Counter(test_dataset.groups)
+    nums = [groups[i] for i in range(len(test_trajs))]
+    outputs2 = outputs.copy()
+    results = []
+    for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
+        tmp_all = outputs2[:num]
+        low_idx = traj.low_idx
+        gps, segs, _ = zip(*src_mm)
+        predict_ids = [segs[0]]
+        predict_gps = [gps[0]]
+        pointer = -1
+        for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
+            if (p1_idx + 1) < p2_idx:
+                pointer += 1
+                tmp = tmp_all[pointer]
+                predict_gps.extend(tmp[0])
+                predict_ids.extend(tmp[1])
+            predict_ids.append(seg)
+            predict_gps.append(latlng)
+        outputs2 = outputs2[num:]
+
+        mm_gps_seq = []
+        mm_eids = []
+        for pt in traj.pt_list:
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(candi_pt.eid)
+            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+        assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
+        results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
+    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
+    
 
 if __name__ == '__main__':
     main()

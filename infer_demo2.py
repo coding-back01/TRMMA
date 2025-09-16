@@ -183,7 +183,7 @@ def main():
     traj_root = os.path.join("data", args.city)
 
     if opts.test_flag:
-        test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'valid')
+        test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
         print('testing dataset shape: ' + str(len(test_dataset)))
         logging.info('testing dataset shape: ' + str(len(test_dataset)))
 

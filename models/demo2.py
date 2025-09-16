@@ -39,6 +39,8 @@ class E2ETrajData(Dataset):
             file = os.path.join(trajs_dir, 'train.pkl')
         elif mode == 'valid':
             file = os.path.join(trajs_dir, 'valid.pkl')
+        elif mode == 'test':
+            file = os.path.join(trajs_dir, 'test_output.pkl')
         else:
             raise NotImplementedError
         trajs = pickle.load(open(file, "rb"))
