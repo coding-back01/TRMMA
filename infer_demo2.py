@@ -14,8 +14,7 @@ import torch.nn.functional as F
 from utils.map import RoadNetworkMapFull
 from utils.spatial_func import SPoint
 from utils.mbr import MBR
-from models.trmma import DAPlanner, TrajRecTestData
-from models.demo2 import E2ETrajData
+from models.demo2 import DAPlanner, E2ETrajData
 from utils.model_utils import AttrDict, gps2grid
 import numpy as np
 from collections import Counter

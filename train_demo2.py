@@ -18,8 +18,7 @@ import torch.optim as optim
 from utils.map import RoadNetworkMapFull
 from utils.spatial_func import SPoint
 from utils.mbr import MBR
-from models.demo2 import E2ETrajData, End2EndModel, E2ELoss
-from models.trmma import DAPlanner
+from models.demo2 import E2ETrajData, End2EndModel, E2ELoss, DAPlanner
 from utils.model_utils import AttrDict, gps2grid
 from tqdm import tqdm
 from collections import Counter
@@ -573,7 +572,8 @@ def main():
             train_dataset.keep_ratio = max(args.keep_ratio, train_dataset.keep_ratio * args.decay_ratio)
             print("==> decay keep_ratio to {} (clamped by {})".format(train_dataset.keep_ratio, args.keep_ratio))
 
-        scheduler.step(valid_id)
+        # 使用总验证损失驱动学习率调度，避免由于去泄露后ID损失不再稳定而误触发调度
+        scheduler.step(valid_loss)
         lr_last = lr
         lr = optimizer.param_groups[0]['lr']
 

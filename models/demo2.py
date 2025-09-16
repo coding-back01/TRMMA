@@ -12,7 +12,13 @@ import torch.nn.utils.rnn as rnn_utils
 
 from models.layers import Attention, GPSFormer, GRFormer, sequence_mask, sequence_mask3d
 from utils.model_utils import gps2grid, get_normalized_t, AttrDict
-from utils.spatial_func import SPoint
+from utils.spatial_func import SPoint, project_pt_to_road, rate2gps
+from utils.trajectory_func import STPoint
+from utils.candidate_point import CandidatePoint
+from preprocess import SparseDAM, SegInfo
+import networkx as nx
+import datetime as dt
+from queue import Queue
 
 
 # ==================== 数据集（端到端） ====================
@@ -50,6 +56,11 @@ class E2ETrajData(Dataset):
             num_k = len(trajs) // num_group
             trajs = trajs[num_k * idx_group: num_k * (idx_group + 1)]
         self.trajs = trajs
+
+        # 非训练阶段：初始化路径规划器，避免使用真值子路径作为先验
+        self.dam = None
+        if self.mode != 'train':
+            self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
 
         # 为与 TRMMA 的最终输出一致：在非 train 模式下，预先构建 groups 与 src_mms
         self.groups = []
@@ -105,11 +116,21 @@ class E2ETrajData(Dataset):
 
                 # TRMMA 监督：目标路段序列与速率（完整高频序列的映射）
                 mm_eids, mm_rates = self._get_trg_seq(trg_list[p1_idx: p2_idx + 1])
-                path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
+                # 先验路径：训练用真值子路径；验证/测试用规划路径，避免泄露
+                if self.mode == 'train':
+                    path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
+                else:
+                    s1, s2 = tmp_seg_seq[0], tmp_seg_seq[1]
+                    ts = getattr(p1, 'time', None)
+                    path = self.dam.planning_multi([s1, s2], ts, mode=self.parameters.planner)
 
                 da_route = [self.rn.valid_edge_one[item] for item in path]
                 src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
                 src_seg_feat = self._get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
+                # 为避免在验证/测试阶段将端点真值段作为输入特征造成泄露，直接置零
+                if self.mode != 'train':
+                    src_seg_seq = [0] * len(src_seg_seq)
+                    src_seg_feat = [[0.0] for _ in src_seg_feat]
                 label = self._get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
 
                 # 打包张量（与现有风格一致）
@@ -238,6 +259,209 @@ class E2ETrajData(Dataset):
             candi_onehot.append(tmp_onehot)
         return candi_onehot, candi_id, candi_feat, candi_mask
 
+
+# ==================== 规划器（内联，去TRMMA依赖） ====================
+
+def get_num_pts(time_span, time_interval):
+    num_pts = 0
+    if time_span % time_interval > time_interval / 2:
+        num_pts = time_span // time_interval
+    elif time_span > time_interval:
+        num_pts = time_span // time_interval - 1
+    return num_pts
+
+
+def calc_cos_value(vec1, vec2):
+    vec1 = np.array(vec1, dtype=float)
+    vec2 = np.array(vec2, dtype=float)
+    a = vec1 * vec1
+    b = vec2 * vec2
+    c = vec1 * vec2
+    denom = np.sqrt(a[0] + a[1]) * np.sqrt(b[0] + b[1])
+    cos_value = (c[0] + c[1]) / denom if denom != 0 else 1.0
+    return cos_value
+
+
+class DAPlanner(object):
+    def __init__(self, dam_root, id_size, utc):
+        self.csm = SparseDAM(dam_root, id_size)
+        self.seg_info = SegInfo(os.path.join(dam_root, "seg_info.csv"))
+        self.G = pickle.load(open(os.path.join(dam_root, "road_graph_wtime"), "rb"))
+        print("Segment Nodes: {}, Edges: {}".format(len(self.G.nodes), len(self.G.edges)))
+        self.vehicle_num = np.load(os.path.join(dam_root, "vehicle_num_{}-48.npy".format(3600)))
+        self.tz = dt.timezone(dt.timedelta(hours=utc))
+
+        self.max_seq_len = 79
+        self.freq_limit = 1
+        self.dcsm_theta = 1
+
+        self.no_path_cnt = 0
+
+    def planning_multi_batch(self, ods, ts):
+        preds = []
+        for i, od in enumerate(ods):
+            route = self.planning_multi(od, ts[i])
+            preds.append(route)
+        return preds
+
+    def planning_multi(self, od, t, mode='da', segs_flag=False):
+        pred = [od[0]]
+        timestamp = t
+        if timestamp is None:
+            timestamp = 0
+        else:
+            timestamp = timestamp + self.seg_info.get_seg_travel_time(od[0])
+        segs = []
+        for i in range(len(od)-1):
+            o = od[i]
+            d = od[i+1]
+
+            if pred[-1] != o:
+                break
+
+            if mode == 'da':
+                col_d = self.csm.get_col(d)
+                route = [o]
+                seg_used = np.zeros(self.seg_info.seg_num, dtype=np.int32)
+                seg_used[o] = 1
+                seg_used[d] = 1
+
+                while len(route) < self.max_seq_len and route[-1] != d:
+                    out_segs = list(self.G.neighbors(route[-1]))
+                    if len(out_segs) == 0:
+                        break
+
+                    nextseg = -1
+                    next_max = -1
+                    tie_cnt = 0
+                    tie_nbrs = []
+                    for seg in out_segs:
+                        if seg == d:
+                            nextseg = d
+                            tie_cnt = 1
+                            break
+
+                        if seg_used[seg] >= self.freq_limit:
+                            continue
+                        curr_prob = col_d[seg]
+                        if curr_prob is None:
+                            curr_prob = 0
+
+                        if curr_prob > next_max:
+                            nextseg = seg
+                            tie_cnt = 1
+                            next_max = curr_prob
+                            tie_nbrs = [seg]
+                        elif curr_prob == next_max:
+                            tie_cnt += 1
+                            tie_nbrs.append(seg)
+
+                    if tie_cnt != 1:
+                        if tie_cnt == 0:
+                            tie_nbrs = out_segs
+
+                        if next_max < self.dcsm_theta:
+                            nextseg, _ = self.break_tie_angle(route[-1], tie_nbrs, d)
+                        else:
+                            nextseg, flag = self.break_tie_traffic_flow(tie_nbrs, timestamp)
+                            if flag:
+                                nextseg, _ = self.break_tie_angle(route[-1], tie_nbrs, d)
+
+                    if nextseg == -1:
+                        break
+                    route.append(nextseg)
+                    timestamp += self.seg_info.get_seg_travel_time(nextseg)
+                    seg_used[nextseg] += 1
+
+                if route[-1] != d:
+                    try:
+                        _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="time")
+                    except nx.exception.NetworkXNoPath:
+                        self.no_path_cnt += 1
+                        route = [o, d]
+                route = self.remove_circle(route)
+            elif mode == 'time':
+                try:
+                    _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="time")
+                except nx.exception.NetworkXNoPath:
+                    self.no_path_cnt += 1
+                    route = [o, d]
+            elif mode == 'length':
+                try:
+                    _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="length")
+                except nx.exception.NetworkXNoPath:
+                    self.no_path_cnt += 1
+                    route = [o, d]
+            else:
+                raise NotImplementedError
+            pred = pred + route[1:]
+            segs.append(route)
+        if segs_flag:
+            return pred, segs
+        else:
+            return pred
+
+    def break_tie_angle(self, curr, tie_nbrs, d):
+        curr_geo = self.seg_info.get_seg_geo(curr)
+        curr_trg = curr_geo[2:]
+        d_geo = self.seg_info.get_seg_geo(d)
+        d_src = d_geo[:2]
+        vec1 = d_src - curr_trg
+
+        nextseg = -1
+        next_max = -2
+        tie_cnt = 0
+        for seg in tie_nbrs:
+            vec2 = self.seg_info.get_seg_vec(seg)
+            cos_value = calc_cos_value(vec1, vec2)
+            if cos_value > next_max:
+                nextseg = seg
+                tie_cnt = 1
+                next_max = cos_value
+            else:
+                tie_cnt += 1
+
+        flag = False
+        return nextseg, flag
+
+    def break_tie_traffic_flow(self, tie_nbrs, timestamp):
+        idx, _ = self.get_time_idx2(timestamp)
+        nextseg = -1
+        next_max = -1
+        tie_cnt = 0
+        for seg in tie_nbrs:
+            prob = self.vehicle_num[seg, idx]
+            if prob > next_max:
+                nextseg = seg
+                tie_cnt = 1
+                next_max = prob
+            elif prob == next_max:
+                tie_cnt += 1
+        flag = False
+        if tie_cnt > 1:
+            flag = True
+        return nextseg, flag
+
+    def get_time_idx2(self, timestamp):
+        time_arr = dt.datetime.fromtimestamp(timestamp, self.tz)
+        if time_arr.weekday() in [0, 1, 2, 3, 4]:
+            idx = time_arr.hour
+        else:
+            idx = time_arr.hour + 24
+        t_r = (time_arr.minute * 60 + time_arr.second) * 1.0 / 3600
+        return int(idx), t_r
+
+    def remove_circle(self, path_fixed):
+        cur = 0
+        while cur < len(path_fixed):
+            eid = path_fixed[cur]
+            idx = []
+            for i in range(cur, len(path_fixed)):
+                if path_fixed[i] == eid:
+                    idx.append(i)
+            path_fixed = path_fixed[0: cur] + path_fixed[max(idx): ]
+            cur += 1
+        return path_fixed
 
 # ==================== MMA 子模型（复用现有定义） ====================
 
