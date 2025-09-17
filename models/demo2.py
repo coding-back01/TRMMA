@@ -89,7 +89,6 @@ class E2ETrajData(Dataset):
     def __getitem__(self, index):
         traj = self.trajs[index]
 
-        # 以论文相同方式下采样，构造 (p1, p2) 的 gap 样本
         if self.mode == 'train':
             length = len(traj.pt_list)
             keep_index = [0] + sorted(random.sample(range(1, length - 1), int((length - 2) * self.keep_ratio))) + [length - 1]
@@ -102,7 +101,7 @@ class E2ETrajData(Dataset):
 
         data = []
         for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], keep_index[:-1], src_list[1:], keep_index[1:]):
-            # 仅对低频点对之间存在 gap 的片段构造样本
+            
             if (p1_idx + 1) < p2_idx:
                 tmp_src_list = [p1, p2]
 
@@ -114,7 +113,7 @@ class E2ETrajData(Dataset):
                 trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
                 candi_onehot, candi_ids, candi_feats, candi_masks = self._build_selector_candidates(trg_candis, tmp_seg_seq)
 
-                # TRMMA 监督：目标路段序列与速率（完整高频序列的映射）
+                # 目标路段序列与速率（完整高频序列的映射）
                 mm_eids, mm_rates = self._get_trg_seq(trg_list[p1_idx: p2_idx + 1])
                 # 先验路径：训练用真值子路径；验证/测试用规划路径，避免泄露
                 if self.mode == 'train':
@@ -133,7 +132,7 @@ class E2ETrajData(Dataset):
                     src_seg_feat = [[0.0] for _ in src_seg_feat]
                 label = self._get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
 
-                # 打包张量（与现有风格一致）
+                # 打包张量
                 da_route = torch.tensor(da_route)
                 src_grid_seq = torch.tensor(ls_grid_seq)
                 src_pro_fea = torch.tensor(features)
@@ -160,7 +159,7 @@ class E2ETrajData(Dataset):
 
         return data
 
-    # ======== 工具函数（保持与现有代码风格） ========
+    # ======== 工具函数 ========
 
     def _get_src_seg_feat(self, gps_seq, seg_seq):
         feats = []
@@ -260,7 +259,7 @@ class E2ETrajData(Dataset):
         return candi_onehot, candi_id, candi_feat, candi_mask
 
 
-# ==================== 规划器（内联，去TRMMA依赖） ====================
+# ==================== 规划器 ====================
 
 def get_num_pts(time_span, time_interval):
     num_pts = 0
