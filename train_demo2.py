@@ -71,7 +71,7 @@ def collate_fn(batch):
 
 def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, device):
     epoch_ttl_loss = 0
-    epoch_mma_loss = 0
+    epoch_selector_loss = 0
     epoch_id_loss = 0
     epoch_rate_loss = 0
 
@@ -95,17 +95,15 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         da_routes, da_lengths, da_pos, d_rids, d_rates, \
         candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-        # 保存 MMA 输入（batch-first）
-        mma_src_seqs = src_seqs.to(device, non_blocking=True)
-        mma_src_lens = src_lengths
-        mma_candi_ids = candi_ids.to(device, non_blocking=True)
-        mma_candi_feats = candi_feats.to(device, non_blocking=True)
-        mma_candi_masks = candi_masks.to(device, non_blocking=True)
+        sel_src_seqs = src_seqs.to(device, non_blocking=True)
+        sel_src_lens = src_lengths
+        sel_candi_ids = candi_ids.to(device, non_blocking=True)
+        sel_candi_feats = candi_feats.to(device, non_blocking=True)
+        sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
-        # TRMMA 输入（与现有训练脚本保持一致的维度）
         src_pro_feas = src_pro_feas.to(device, non_blocking=True)
         trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-        src_seqs_tr = mma_src_seqs.permute(1, 0, 2)  # [src_len, bs, 3]
+        src_seqs_tr = sel_src_seqs.permute(1, 0, 2)  # [src_len, bs, 3]
         trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
         trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
         src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
@@ -119,9 +117,7 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         t2 = time.time()
 
         outputs = model(
-            # MMA
-            mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
-            # TRMMA
+            sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
             src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
             src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
             src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio
@@ -131,7 +127,7 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         t3 = time.time()
 
         labels = {
-            'mma_onehot': candi_onehots.to(device, non_blocking=True),
+            'selector_onehot': candi_onehots.to(device, non_blocking=True),
             'trg_labels': trg_rid_labels,
             'trg_rates': trg_rates
         }
@@ -148,30 +144,33 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         optimizer.zero_grad(set_to_none=True)
         time_zero += time.time() - t4
         t5 = time.time()
+
         ttl_loss.backward()
         time_gradient += time.time() - t5
         t6 = time.time()
+
         optimizer.step()
         time_update += time.time() - t6
 
         epoch_ttl_loss += ttl_loss.item()
-        epoch_mma_loss += loss_dict['mma']
+
+        epoch_selector_loss += loss_dict['selector']
         epoch_id_loss += loss_dict['id']
         epoch_rate_loss += loss_dict['rate']
 
         if len(iterator) >= 10 and (i + 1) % (len(iterator) // 10) == 0:
-            print("==>{}: {}, {}, {}, {}".format((i + 1) // (len(iterator) // 10), epoch_ttl_loss / (i + 1), epoch_mma_loss / (i + 1), epoch_id_loss / (i + 1), epoch_rate_loss / (i + 1)))
+            print("==>{}: {}, {}, {}, {}".format((i + 1) // (len(iterator) // 10), epoch_ttl_loss / (i + 1), epoch_selector_loss / (i + 1), epoch_id_loss / (i + 1), epoch_rate_loss / (i + 1)))
         time_ttl2 += time.time() - t1
-
     time_ttl += time.time() - t0
     # print(time_ttl, time_ttl - time_ttl2, time_move, time_forward, time_loss, time_zero, time_gradient, time_update)
     # print(np.sum(model.trmma.timer6), np.sum(model.trmma.timer1), np.sum(model.trmma.timer2), np.sum(model.trmma.timer3), np.sum(model.trmma.timer4), np.sum(model.trmma.timer5))
-    return epoch_ttl_loss / len(iterator), epoch_mma_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
+    
+    return epoch_ttl_loss / len(iterator), epoch_selector_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
 
 
 def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
     epoch_ttl_loss = 0
-    epoch_mma_loss = 0
+    epoch_selector_loss = 0
     epoch_id_loss = 0
     epoch_rate_loss = 0
 
@@ -183,15 +182,15 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
             da_routes, da_lengths, da_pos, d_rids, d_rates, \
             candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-            mma_src_seqs = src_seqs.to(device, non_blocking=True)
-            mma_src_lens = src_lengths
-            mma_candi_ids = candi_ids.to(device, non_blocking=True)
-            mma_candi_feats = candi_feats.to(device, non_blocking=True)
-            mma_candi_masks = candi_masks.to(device, non_blocking=True)
+            sel_src_seqs = src_seqs.to(device, non_blocking=True)
+            sel_src_lens = src_lengths
+            sel_candi_ids = candi_ids.to(device, non_blocking=True)
+            sel_candi_feats = candi_feats.to(device, non_blocking=True)
+            sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
             src_pro_feas = src_pro_feas.to(device, non_blocking=True)
             trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-            src_seqs_tr = mma_src_seqs.permute(1, 0, 2)
+            src_seqs_tr = sel_src_seqs.permute(1, 0, 2)
             trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
             trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
 
@@ -204,14 +203,14 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
             src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
 
             outputs = model(
-                mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
+                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
                 src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
                 src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
                 src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=0
             )
 
             labels = {
-                'mma_onehot': candi_onehots.to(device, non_blocking=True),
+                'selector_onehot': candi_onehots.to(device, non_blocking=True),
                 'trg_labels': trg_rid_labels,
                 'trg_rates': trg_rates
             }
@@ -223,20 +222,17 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
             ttl_loss, loss_dict = criterion(outputs, labels, lengths)
 
             epoch_ttl_loss += ttl_loss.item()
-            epoch_mma_loss += loss_dict['mma']
+            epoch_selector_loss += loss_dict['selector']
             epoch_id_loss += loss_dict['id']
             epoch_rate_loss += loss_dict['rate']
 
-        print((epoch_ttl_loss) / (i + 1), epoch_mma_loss / (i + 1), epoch_id_loss / (i + 1), epoch_rate_loss / (i + 1))
+        print((epoch_ttl_loss) / (i + 1), epoch_selector_loss / (i + 1), epoch_id_loss / (i + 1), epoch_rate_loss / (i + 1))
 
-    return epoch_ttl_loss / len(iterator), epoch_mma_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
+    return epoch_ttl_loss / len(iterator), epoch_selector_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
 
 
 def get_results(predict_id, predict_rate, target_id, target_rate, trg_len, routes, route_lengths):
-    """
-    统一与 TRMMA 的推理输出风格，但不依赖 trg_gps：
-    返回 [pred_seg, pred_rate, trg_id, trg_rate, route]。
-    """
+
     predict_id = predict_id.permute(1, 0).detach().cpu().tolist()
     predict_rate = predict_rate.permute(1, 0).detach().cpu().tolist()
     target_id = target_id.permute(1, 0).detach().cpu().tolist()
@@ -265,17 +261,15 @@ def infer(model, iterator, rid_features_dict, device):
             da_routes, da_lengths, da_pos, d_rids, d_rates, \
             candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-            # MMA inputs
-            mma_src_seqs = src_seqs.to(device, non_blocking=True)
-            mma_src_lens = src_lengths
-            mma_candi_ids = candi_ids.to(device, non_blocking=True)
-            mma_candi_feats = candi_feats.to(device, non_blocking=True)
-            mma_candi_masks = candi_masks.to(device, non_blocking=True)
+            sel_src_seqs = src_seqs.to(device, non_blocking=True)
+            sel_src_lens = src_lengths
+            sel_candi_ids = candi_ids.to(device, non_blocking=True)
+            sel_candi_feats = candi_feats.to(device, non_blocking=True)
+            sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
-            # TRMMA inputs
             src_pro_feas = src_pro_feas.to(device, non_blocking=True)
             trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-            src_seqs_tr = mma_src_seqs.permute(1, 0, 2)
+            src_seqs_tr = sel_src_seqs.permute(1, 0, 2)
             trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
             trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
 
@@ -288,9 +282,9 @@ def infer(model, iterator, rid_features_dict, device):
             src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
 
             outputs = model(
-                # MMA
-                mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
-                # TRMMA
+                # selector
+                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
+                # reconstructor
                 src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
                 src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
                 src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=-1
@@ -323,31 +317,31 @@ def infer(model, iterator, rid_features_dict, device):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='E2E MMA+TRMMA')
+    parser = argparse.ArgumentParser(description='E2E Selector+Reconstructor')
     parser.add_argument('--city', type=str, default='porto')
     parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
     parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')
-    parser.add_argument('--lambda_mma', type=float, default=1.0, help='weight for mma bce')
+    parser.add_argument('--lambda_selector', type=float, default=1.0, help='weight for selector bce')
     parser.add_argument('--lambda1', type=float, default=10, help='weight for seg bce')
     parser.add_argument('--lambda2', type=float, default=5, help='weight for rate l1')
     parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
-    parser.add_argument('--epochs', type=int, default=30, help='epochs')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=50, help='epochs')
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--transformer_layers', type=int, default=2)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
     parser.add_argument('--small', action='store_true')
-    parser.add_argument('--direction_flag', action='store_true')
-    parser.add_argument('--attn_flag', action='store_true')
+    parser.add_argument('--direction_flag', action='store_true', default=True)
+    parser.add_argument('--attn_flag', action='store_true', default=True)
     parser.add_argument("--candi_size", type=int, default=10)
     parser.add_argument('--num_worker', type=int, default=8)
     parser.add_argument('--init_ratio', type=float, default=0.5)
     parser.add_argument('--only_direction', action='store_true')
-    parser.add_argument('--da_route_flag', action='store_true')
-    parser.add_argument('--srcseg_flag', action='store_true')
-    parser.add_argument('--gps_flag', action='store_true')
+    parser.add_argument('--da_route_flag', action='store_true', default=True)
+    parser.add_argument('--srcseg_flag', action='store_true', default=True)
+    parser.add_argument('--gps_flag', action='store_true', default=True)
     parser.add_argument('--planner', type=str, default='da')
 
     opts = parser.parse_args()
@@ -364,7 +358,7 @@ def main():
     torch.backends.cudnn.deterministic = True
     print('device', device)
     
-    model_save_root = f'./model/TRMMA/{opts.city}/'
+    model_save_root = f'./model/E2E/{opts.city}/'
     model_save_path = model_save_root + 'E2E_' + opts.city + '_' + 'keep-ratio_' + str(opts.keep_ratio) + '_' + time.strftime("%Y%m%d_%H%M%S") + '/'
     if not os.path.exists(model_save_path):
         os.makedirs(model_save_path)
@@ -398,7 +392,6 @@ def main():
     map_root = os.path.join("data", opts.city, "roadnet")
     rn = RoadNetworkMapFull(map_root, zone_range=zone_range, unit_length=50)
 
-    # 参数（与两侧模型兼容）
     args = AttrDict()
     args_dict = {
         'device': device,
@@ -481,7 +474,6 @@ def main():
 
     traj_root = os.path.join("data", args.city)
 
-    # ===== 固定流程：训练 -> 验证 -> 测试 =====
     train_dataset = E2ETrajData(rn, traj_root, mbr, args, 'train')
     valid_dataset = E2ETrajData(rn, traj_root, mbr, args, 'valid')
     print('training dataset shape: ' + str(len(train_dataset)))
@@ -493,26 +485,23 @@ def main():
     train_iterator = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
     valid_iterator = DataLoader(valid_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=False)
 
-    # 将同一份参数用于两侧子模型，确保嵌入维度、id_size 等一致
-    mma_args = args
-    trmma_args = args
-    model = End2EndModel(mma_args, trmma_args).to(device)
+    model = End2EndModel(args).to(device)
 
     print('model', str(model))
     logging.info('model' + str(model))
 
-    tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
+    ls_train_loss, ls_train_mma_loss, ls_train_id_loss, ls_train_rate_loss = [], [], [], []
+    ls_valid_loss, ls_valid_mma_loss, ls_valid_id_loss, ls_valid_rate_loss = [], [], [], []
 
     best_valid_loss = float('inf')
     best_epoch = 0
-
-    ls_train_loss, ls_train_mma_loss, ls_train_id_loss, ls_train_rate_loss = [], [], [], []
-    ls_valid_loss, ls_valid_mma_loss, ls_valid_id_loss, ls_valid_rate_loss = [], [], [], []
+    
+    tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
 
     lr = args.learning_rate
     optimizer = optim.AdamW(model.parameters(), lr=lr)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_step, factor=args.lr_decay, threshold=1e-3)
-    criterion = E2ELoss(lambda_mma=opts.lambda_mma, lambda_id=args.lambda1, lambda_rate=args.lambda2)
+    criterion = E2ELoss(lambda_selector=opts.lambda_selector, lambda_id=args.lambda1, lambda_rate=args.lambda2)
 
     stopping_count = 0
     train_times = []
@@ -521,22 +510,22 @@ def main():
 
         print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(train_dataset.keep_ratio, args.tf_ratio, lr))
         t_train = time.time()
-        train_loss, train_mma, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
+        train_loss, train_selector, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
         end_train = time.time()
         print("training: {}".format(end_train - t_train))
 
         ls_train_loss.append(train_loss)
-        ls_train_mma_loss.append(train_mma)
+        ls_train_mma_loss.append(train_selector)
         ls_train_id_loss.append(train_id)
         ls_train_rate_loss.append(train_rate)
 
         print("==> validating...")
         t_valid = time.time()
-        valid_loss, valid_mma, valid_id, valid_rate = evaluate(model, valid_iterator, criterion, rid_features_dict, args, device)
+        valid_loss, valid_selector, valid_id, valid_rate = evaluate(model, valid_iterator, criterion, rid_features_dict, args, device)
         print("validating: {}".format(time.time() - t_valid))
 
         ls_valid_loss.append(valid_loss)
-        ls_valid_mma_loss.append(valid_mma)
+        ls_valid_mma_loss.append(valid_selector)
         ls_valid_id_loss.append(valid_id)
         ls_valid_rate_loss.append(valid_rate)
 
@@ -552,27 +541,26 @@ def main():
         else:
             stopping_count += 1
 
-        tb_writer.add_scalars('Train_loss', {'total': train_loss, 'RID': train_id, 'Rate': train_rate, 'MMA': train_mma}, epoch)
-        tb_writer.add_scalars('Valid_loss', {'total': valid_loss, 'RID': valid_id, 'Rate': valid_rate, 'MMA': valid_mma}, epoch)
+        tb_writer.add_scalars('Train_loss', {'total': train_loss, 'RID': train_id, 'Rate': train_rate, 'Selector': train_selector}, epoch)
+        tb_writer.add_scalars('Valid_loss', {'total': valid_loss, 'RID': valid_id, 'Rate': valid_rate, 'Selector': valid_selector}, epoch)
         tb_writer.add_scalar('learning_rate', lr, epoch)
         tb_writer.add_scalars('TTL_loss', {'Train': train_loss, 'Valid': valid_loss}, epoch)
         tb_writer.add_scalars('Seg_loss', {'Train': train_id, 'Valid': valid_id}, epoch)
         tb_writer.add_scalars('Rate_loss', {'Train': train_rate, 'Valid': valid_rate}, epoch)
-        tb_writer.add_scalars('MMA_loss', {'Train': train_mma, 'Valid': valid_mma}, epoch)
+        tb_writer.add_scalars('Selector_loss', {'Train': train_selector, 'Valid': valid_selector}, epoch)
 
         if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
             logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
             logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(train_dataset.keep_ratio))
-            logging.info('\tTrain Total:' + str(train_loss) + '\tMMA:' + str(train_mma) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
-            logging.info('\tValid Total:' + str(valid_loss) + '\tMMA:' + str(valid_mma) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
+            logging.info('\tTrain Total:' + str(train_loss) + '\tSelector:' + str(train_selector) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
+            logging.info('\tValid Total:' + str(valid_loss) + '\tSelector:' + str(valid_selector) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
             torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
         if args.decay_flag:
             args.tf_ratio = args.tf_ratio * args.decay_ratio
-            # 与 MMA 保持一致：keep_ratio 每轮按 decay_ratio 衰减，但不低于 keep_ratio 下限
+
             train_dataset.keep_ratio = max(args.keep_ratio, train_dataset.keep_ratio * args.decay_ratio)
             print("==> decay keep_ratio to {} (clamped by {})".format(train_dataset.keep_ratio, args.keep_ratio))
 
-        # 使用总验证损失驱动学习率调度，避免由于去泄露后ID损失不再稳定而误触发调度
         scheduler.step(valid_loss)
         lr_last = lr
         lr = optimizer.param_groups[0]['lr']
@@ -583,21 +571,18 @@ def main():
         if stopping_count >= 5:
             print("==> [Info] Early Stop After Epoch {}.".format(epoch))
             break
-
     tb_writer.close()
     logging.info('Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
     print('==> Best Epoch: {}, {}'.format(best_epoch, best_valid_loss))
     logging.info('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
     print('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
 
-    # ===== 测试阶段 =====
     test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
     print('testing dataset shape: ' + str(len(test_dataset)))
     logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
     test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=True)
 
-    # 加载验证集最佳权重进行测试
     model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
     print('==> Model Loaded')
 
@@ -611,45 +596,12 @@ def main():
     print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
     pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
 
-    # Gap-level metrics (same as infer_demo2)
     outputs = []
     for pred_seg, pred_rate, trg_id, trg_rate, route in data:
         pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
         trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
         outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
 
-    print('==> Starting Evaluation...')
-    epoch_id1_loss = []
-    epoch_recall_loss = []
-    epoch_precision_loss = []
-    epoch_f1_loss = []
-    epoch_mae_loss = []
-    epoch_rmse_loss = []
-    for pred_gps, pred_seg, trg_gps, trg_id in outputs:
-        recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
-        epoch_id1_loss.append(loss_ids1)
-        epoch_recall_loss.append(recall)
-        epoch_precision_loss.append(precision)
-        epoch_f1_loss.append(f1)
-        epoch_mae_loss.append(loss_mae)
-        epoch_rmse_loss.append(loss_rmse)
-
-    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
-    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
-    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
-    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
-    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
-    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
-    print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
-    logging.info('Time: ' + str(epoch_secs) + 's')
-    logging.info('\tTest RID Acc:' + str(test_id_acc) +
-                 '\tTest RID Recall:' + str(test_id_recall) +
-                 '\tTest RID Precision:' + str(test_id_precision) +
-                 '\tTest RID F1 Score:' + str(test_id_f1) +
-                 '\tTest MAE Loss:' + str(test_mae) +
-                 '\tTest RMSE Loss:' + str(test_rmse))
-
-    # Reconstruct full trajectory outputs for visualization/sharing
     test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
     groups = Counter(test_dataset.groups)
     nums = [groups[i] for i in range(len(test_trajs))]
@@ -682,6 +634,38 @@ def main():
         results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
     pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
     
+    print('==> Starting Evaluation...')
+    epoch_id1_loss = []
+    epoch_recall_loss = []
+    epoch_precision_loss = []
+    epoch_f1_loss = []
+    epoch_mae_loss = []
+    epoch_rmse_loss = []
+    for pred_gps, pred_seg, trg_gps, trg_id in results:
+        recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
+        epoch_id1_loss.append(loss_ids1)
+        epoch_recall_loss.append(recall)
+        epoch_precision_loss.append(precision)
+        epoch_f1_loss.append(f1)
+        epoch_mae_loss.append(loss_mae)
+        epoch_rmse_loss.append(loss_rmse)
+
+    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
+    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
+    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
+    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
+    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
+    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
+    print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
+
+    logging.info('Time: ' + str(epoch_secs) + 's')
+    logging.info('\tTest RID Acc:' + str(test_id_acc) +
+                 '\tTest RID Recall:' + str(test_id_recall) +
+                 '\tTest RID Precision:' + str(test_id_precision) +
+                 '\tTest RID F1 Score:' + str(test_id_f1) +
+                 '\tTest MAE Loss:' + str(test_mae) +
+                 '\tTest RMSE Loss:' + str(test_rmse))
+
 
 if __name__ == '__main__':
     main()

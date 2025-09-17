@@ -25,8 +25,8 @@ from queue import Queue
 
 class E2ETrajData(Dataset):
     """
-    端到端训练数据集：在 TRMMA 的样本粒度上（低频点对之间的 gap）构造样本，
-    同时返回 MMA 所需的候选集与标签，保证两端输入齐备并可端到端训练。
+    端到端训练数据集：按低频点对之间的 gap 构造样本，
+    同时返回候选集与标签，保证两端输入齐备并可端到端训练。
     """
 
     def __init__(self, rn, trajs_dir, mbr, parameters, mode):
@@ -62,7 +62,7 @@ class E2ETrajData(Dataset):
         if self.mode != 'train':
             self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
 
-        # 为与 TRMMA 的最终输出一致：在非 train 模式下，预先构建 groups 与 src_mms
+        # 为与最终输出一致：在非 train 模式下，预先构建 groups 与 src_mms
         self.groups = []
         self.src_mms = []
         if self.mode != 'train':
@@ -106,13 +106,13 @@ class E2ETrajData(Dataset):
             if (p1_idx + 1) < p2_idx:
                 tmp_src_list = [p1, p2]
 
-                # 基础序列（与 TRMMA 一致）：
+                # 基础序列：
                 ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self._get_src_seq(tmp_src_list)
                 features = self._get_pro_features(tmp_src_list, hours)
 
-                # MMA 候选：对两个端点生成候选集（保持与 MMA 训练一致的9维候选特征）
+                # 候选生成：对两个端点生成候选集（9维候选特征）
                 trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
-                candi_onehot, candi_ids, candi_feats, candi_masks = self._build_mma_candidates(trg_candis, tmp_seg_seq)
+                candi_onehot, candi_ids, candi_feats, candi_masks = self._build_selector_candidates(trg_candis, tmp_seg_seq)
 
                 # TRMMA 监督：目标路段序列与速率（完整高频序列的映射）
                 mm_eids, mm_rates = self._get_trg_seq(trg_list[p1_idx: p2_idx + 1])
@@ -146,13 +146,13 @@ class E2ETrajData(Dataset):
                 d_rid = trg_rid[-1]
                 d_rate = trg_rate[-1]
 
-                # MMA 所需的候选与标签
+                # 候选与标签
                 candi_onehot = torch.tensor(candi_onehot)
                 candi_ids = torch.tensor(candi_ids) + 1  # 与 MMA 一致：+1 避免0索引
                 candi_feats = torch.tensor(candi_feats)
                 candi_masks = torch.tensor(candi_masks, dtype=torch.float32)
 
-                # 返回顺序遵循 TRMMA，再追加 MMA 字段，便于 collate 对齐
+                # 返回顺序：先基础字段，再追加候选相关字段，便于 collate 对齐
                 data.append([
                     da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_rid, trg_rate, label, d_rid, d_rate,
                     candi_onehot, candi_ids, candi_feats, candi_masks
@@ -225,8 +225,8 @@ class E2ETrajData(Dataset):
             hour += 24
         return hour
 
-    def _build_mma_candidates(self, ls_candi, trg_id_seq):
-        """构造 MMA 的候选集张量与 one-hot 标签（对齐 top-k 候选）。"""
+    def _build_selector_candidates(self, ls_candi, trg_id_seq):
+        """构造候选集张量与 one-hot 标签（对齐 top-k 候选）。"""
         candi_id = []
         candi_feat = []
         candi_onehot = []
@@ -463,10 +463,10 @@ class DAPlanner(object):
             cur += 1
         return path_fixed
 
-# ==================== MMA 子模型（复用现有定义） ====================
+# ==================== 选择器分支 ====================
 
-class MMAEncoder(nn.Module):
-    """与 models.mma.Encoder 一致，简化导入依赖，避免循环引用。"""
+class SelectorEncoder(nn.Module):
+    """序列编码器（候选选择分支）。复用通用 Encoder，避免循环引用。"""
 
     def __init__(self, parameters):
         super().__init__()
@@ -497,8 +497,8 @@ class MMAEncoder(nn.Module):
 from models.layers import Encoder  # 复用同名 Encoder
 
 
-class GPS2Seg(nn.Module):
-    """与 models.mma.GPS2Seg 相同定义，保留概率输出，便于 BCE 与软嵌入计算。"""
+class SelectorHead(nn.Module):
+    """候选选择头：输出每个候选的选择概率及其向量表征。"""
 
     def __init__(self, parameters):
         super().__init__()
@@ -507,7 +507,7 @@ class GPS2Seg(nn.Module):
         self.only_direction = parameters.only_direction
 
         self.emb_id = nn.Embedding(parameters.id_size, parameters.id_emb_dim)
-        self.encoder = MMAEncoder(parameters)
+        self.encoder = SelectorEncoder(parameters)
 
         fc_id_out_input_dim = parameters.hid_dim
         if self.direction_flag:
@@ -531,7 +531,7 @@ class GPS2Seg(nn.Module):
         self.params = parameters
         self.hid_dim = parameters.hid_dim
 
-        # 与 MMA 保持一致的权重初始化
+        # 权重初始化
         self.init_weights()
 
     def init_weights(self):
@@ -569,7 +569,7 @@ class GPS2Seg(nn.Module):
         return output_multi, candi_vec, outputs_id
 
 
-# ==================== TRMMA 子模型（带软段嵌入注入） ====================
+# ==================== 重建分支（带软段嵌入注入） ====================
 
 class GPSEncoder(nn.Module):
     def __init__(self, parameters):
@@ -751,10 +751,10 @@ class DecoderMulti(nn.Module):
         return outputs_id, outputs_rate
 
 
-class TrajRecoveryE2E(nn.Module):
+class Reconstructor(nn.Module):
     """
-    TRMMA 改造版：在 GPS 编码输入端注入“软路段嵌入”（来自 MMA 的候选分布加权和），
-    从而让 TRMMA 的损失可以通过该通道反向到 MMA。
+    轨迹重建器：在 GPS 编码端注入“软路段嵌入”（来自候选分布加权和），
+    使重建损失能通过该通道反向更新选择分支。
     """
 
     def __init__(self, parameters):
@@ -772,7 +772,7 @@ class TrajRecoveryE2E(nn.Module):
             self.pos_embedding_gps = nn.Embedding(max_input_length, parameters.hid_dim)
             self.pos_embedding_route = nn.Embedding(max_input_length, parameters.hid_dim)
 
-        # 与 TRMMA 不同点：GPS 输入额外拼接一份 hid_dim 的软段嵌入
+        # GPS 输入额外拼接一份 hid_dim 的软段嵌入
         input_dim_gps = 3
         if self.learn_pos:
             input_dim_gps += parameters.hid_dim
@@ -794,19 +794,13 @@ class TrajRecoveryE2E(nn.Module):
             self.encoder = GPSEncoder(parameters)
         self.decoder = DecoderMulti(parameters)
 
-        # forward 内阶段计时（与 TRMMA 对齐）
+        # forward 内阶段计时
         self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []
 
-        # 权重初始化（与 MMA/TRMMA 保持一致）
+        # 权重初始化
         self.init_weights()
 
     def init_weights(self):
-        """
-        与 MMA/TRMMA 相同的权重初始化策略：
-        - RNN 的 weight_ih 用 Xavier 均匀
-        - RNN 的 weight_hh 用正交
-        - bias 全部置 0
-        """
         ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
         hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
         b = (param.data for name, param in self.named_parameters() if 'bias' in name)
@@ -834,7 +828,7 @@ class TrajRecoveryE2E(nn.Module):
         if self.srcseg_flag:
             seg_emb = self.emb_id[src_seg_seqs]
             gps_emb = torch.cat((gps_emb, seg_emb, src_seg_feats), dim=-1)
-        # 注入来自 MMA 的软段嵌入（维度 [src_len, bs, hid_dim]）
+
         gps_emb = torch.cat([gps_emb, soft_seg_emb], dim=-1)
         gps_in = self.fc_in_gps(gps_emb)
         gps_in_lens = torch.tensor(src_len, device=src.device)
@@ -880,40 +874,40 @@ class TrajRecoveryE2E(nn.Module):
 
 class End2EndModel(nn.Module):
     """
-    将 MMA 与 TRMMA 串联：
-    - MMA 对低频端点生成候选概率分布，并形成“软段嵌入”；
-    - TRMMAE2E 接收软段嵌入，进行解码恢复；
-    - TRMMA 的损失通过软段嵌入反传到 MMA。
+    端到端结构：
+    - 选择器对端点生成候选概率分布，形成“软段嵌入”；
+    - 重建器接收软段嵌入进行解码重建；
+    - 重建损失可反向更新选择器。
     """
 
-    def __init__(self, mma_args: AttrDict, trmma_args: AttrDict):
+    def __init__(self, args: AttrDict):
         super().__init__()
-        self.mma = GPS2Seg(mma_args)
-        self.trmma = TrajRecoveryE2E(trmma_args)
+        self.selector = SelectorHead(args)
+        self.reconstructor = Reconstructor(args)
 
     def forward(self,
-                # MMA 输入
-                mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks,
-                # TRMMA 输入
+                # 选择器输入
+                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
+                # 重建器输入
                 src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
                 pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
                 src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):
 
-        # 1) MMA 前向：两端点的候选概率分布
-        mma_out_multi, mma_candi_vec, mma_probs = self.mma(mma_src_seqs, mma_src_lens, mma_candi_ids, mma_candi_feats, mma_candi_masks)
+        # 1) 选择器前向：两端点的候选概率分布
+        sel_out_multi, sel_candi_vec, sel_probs = self.selector(sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks)
         # 软段嵌入（概率加权和），形状 [bs, src_len, hid]
-        soft_seg_emb = (mma_probs.unsqueeze(-1) * mma_candi_vec).sum(dim=-2)
-        # 转换为 TRMMA 期望的 [src_len, bs, hid]
+        soft_seg_emb = (sel_probs.unsqueeze(-1) * sel_candi_vec).sum(dim=-2)
+        # 转换为重建器期望的 [src_len, bs, hid]
         soft_seg_emb = soft_seg_emb.permute(1, 0, 2)
 
-        # 2) TRMMA 前向：注入软嵌入
-        out_ids, out_rates = self.trmma(src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
-                                        pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
-                                        src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio,
-                                        soft_seg_emb)
+        # 2) 重建器前向：注入软嵌入
+        out_ids, out_rates = self.reconstructor(src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
+                                                pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
+                                                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio,
+                                                soft_seg_emb)
 
         return {
-            'mma_probs': mma_probs,  # [bs, src_len, candi]
+            'selector_probs': sel_probs,  # [bs, src_len, candi]
             'out_ids': out_ids,      # [trg_len-2, bs, da_len]
             'out_rates': out_rates   # [trg_len-2, bs, 1]
         }
@@ -922,24 +916,22 @@ class End2EndModel(nn.Module):
 # ==================== 损失函数（联合） ====================
 
 class E2ELoss(nn.Module):
-    """联合损失：MMA BCE + TRMMA BCE + TRMMA L1。"""
 
-    def __init__(self, lambda_mma=1.0, lambda_id=10.0, lambda_rate=5.0):
+    def __init__(self, lambda_selector=1.0, lambda_id=10.0, lambda_rate=5.0):
         super().__init__()
-        self.lambda_mma = lambda_mma
+        self.lambda_selector = lambda_selector
         self.lambda_id = lambda_id
         self.lambda_rate = lambda_rate
-        self.crit_mma = nn.BCELoss(reduction='mean')
+        self.crit_selector = nn.BCELoss(reduction='mean')
         self.crit_id = nn.BCELoss(reduction='sum')
         self.crit_rate = nn.L1Loss(reduction='sum')
 
     def forward(self, outputs, labels, lengths):
-        # MMA
-        mma_probs = outputs['mma_probs']  # [bs, 2, k]
-        mma_onehot = labels['mma_onehot'].float()  # [bs, 2, k]
-        loss_mma = self.crit_mma(mma_probs, mma_onehot) * mma_probs.shape[-1]
 
-        # TRMMA
+        selector_probs = outputs['selector_probs']  # [bs, 2, k]
+        selector_onehot = labels['selector_onehot'].float()  # [bs, 2, k]
+        loss_selector = self.crit_selector(selector_probs, selector_onehot) * selector_probs.shape[-1]
+
         out_ids = outputs['out_ids']       # [trg_len-2, bs, da_len]
         out_rates = outputs['out_rates']   # [trg_len-2, bs, 1]
         trg_labels = labels['trg_labels']  # 已与模型输出对齐（中间步），不再裁剪
@@ -955,7 +947,7 @@ class E2ELoss(nn.Module):
         loss_id = self.crit_id(out_ids, trg_labels) * self.lambda_id / denom_id
         loss_rate = self.crit_rate(out_rates, trg_rates) * self.lambda_rate / denom_rate
 
-        total = self.lambda_mma * loss_mma + loss_id + loss_rate
-        return total, {'mma': loss_mma.item(), 'id': loss_id.item(), 'rate': loss_rate.item()}
+        total = self.lambda_selector * loss_selector + loss_id + loss_rate
+        return total, {'selector': loss_selector.item(), 'id': loss_id.item(), 'rate': loss_rate.item()}
 
 

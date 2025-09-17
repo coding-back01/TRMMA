@@ -27,28 +27,27 @@ def main():
     parser.add_argument('--city', type=str, default='porto')
     parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
     parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')
-    parser.add_argument('--lambda_mma', type=float, default=1.0, help='weight for mma bce')
+    parser.add_argument('--lambda_selector', type=float, default=1.0, help='weight for selector bce')
     parser.add_argument('--lambda1', type=float, default=10, help='weight for seg bce')
     parser.add_argument('--lambda2', type=float, default=5, help='weight for rate l1')
     parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
-    parser.add_argument('--epochs', type=int, default=30, help='epochs')
-    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--epochs', type=int, default=50, help='epochs')
+    parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--transformer_layers', type=int, default=2)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
-    parser.add_argument('--test_flag', action='store_true', help='flag of testing')
     parser.add_argument('--small', action='store_true')
-    parser.add_argument('--direction_flag', action='store_true')
-    parser.add_argument('--attn_flag', action='store_true')
+    parser.add_argument('--direction_flag', action='store_true', default=True)
+    parser.add_argument('--attn_flag', action='store_true', default=True)
     parser.add_argument("--candi_size", type=int, default=10)
     parser.add_argument('--num_worker', type=int, default=8)
     parser.add_argument('--init_ratio', type=float, default=0.5)
     parser.add_argument('--only_direction', action='store_true')
-    parser.add_argument('--da_route_flag', action='store_true')
-    parser.add_argument('--srcseg_flag', action='store_true')
-    parser.add_argument('--gps_flag', action='store_true')
+    parser.add_argument('--da_route_flag', action='store_true', default=True)
+    parser.add_argument('--srcseg_flag', action='store_true', default=True)
+    parser.add_argument('--gps_flag', action='store_true', default=True)
     parser.add_argument('--planner', type=str, default='da')
 
     opts = parser.parse_args()
@@ -104,11 +103,6 @@ def main():
         'device': device,
         'transformer_layers': opts.transformer_layers,
         'heads': opts.heads,
-        'direction_flag': opts.direction_flag,
-        'attn_flag': opts.attn_flag,
-        'candi_size': opts.candi_size,
-        'init_ratio': opts.init_ratio,
-        'only_direction': opts.only_direction,
         'tandem_fea_flag': True,
         'pro_features_flag': True,
         'srcseg_flag': opts.srcseg_flag,
@@ -166,6 +160,11 @@ def main():
         'small': opts.small,
         'dam_root': os.path.join("data", opts.city),
         'planner': opts.planner,
+        'direction_flag': opts.direction_flag,
+        'attn_flag': opts.attn_flag,
+        'candi_size': opts.candi_size,
+        'init_ratio': opts.init_ratio,
+        'only_direction': opts.only_direction
     }
     args.update(args_dict)
 
@@ -181,99 +180,94 @@ def main():
 
     traj_root = os.path.join("data", args.city)
 
-    if opts.test_flag:
-        test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
-        print('testing dataset shape: ' + str(len(test_dataset)))
-        logging.info('testing dataset shape: ' + str(len(test_dataset)))
+    test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
+    print('testing dataset shape: ' + str(len(test_dataset)))
+    logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn(x), num_workers=opts.num_worker, pin_memory=True)
+    test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=True)
 
-        model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
-        print('==> Model Loaded')
+    model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
+    print('==> Model Loaded')
 
-        print("==> Starting Prediction...")
-        start_time = time.time()
-        data = infer(model, test_iterator, rid_features_dict, device)
-        end_time = time.time()
-        epoch_secs = end_time - start_time
-        print('Time: ' + str(epoch_secs) + 's')
-        logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / len(test_dataset) * 1000, len(test_dataset) / (end_time - start_time)))
-        print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / len(test_dataset) * 1000, len(test_dataset) / (end_time - start_time)))
-        pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
+    print('==> Starting Prediction...')
+    start_time = time.time()
+    data = infer(model, test_iterator, rid_features_dict, device)
+    end_time = time.time()
+    epoch_secs = end_time - start_time
+    print('Time: ' + str(epoch_secs) + 's')
+    logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
+    print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
+    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
 
-        outputs = []
-        for pred_seg, pred_rate, trg_id, trg_rate, route in data:
-            pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
-            trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
-            outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
+    outputs = []
+    for pred_seg, pred_rate, trg_id, trg_rate, route in data:
+        pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
+        trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
+        outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
 
-        print("==> Starting Evaluation...")
-        epoch_id1_loss = []
-        epoch_recall_loss = []
-        epoch_precision_loss = []
-        epoch_f1_loss = []
-        epoch_mae_loss = []
-        epoch_rmse_loss = []
-        for pred_gps, pred_seg, trg_gps, trg_id in outputs:
-            recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
-            epoch_id1_loss.append(loss_ids1)
-            epoch_recall_loss.append(recall)
-            epoch_precision_loss.append(precision)
-            epoch_f1_loss.append(f1)
-            epoch_mae_loss.append(loss_mae)
-            epoch_rmse_loss.append(loss_rmse)
+    test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
+    groups = Counter(test_dataset.groups)
+    nums = [groups[i] for i in range(len(test_trajs))]
+    outputs2 = outputs.copy()
+    results = []
+    for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
+        tmp_all = outputs2[:num]
+        low_idx = traj.low_idx
+        gps, segs, _ = zip(*src_mm)
+        predict_ids = [segs[0]]
+        predict_gps = [gps[0]]
+        pointer = -1
+        for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
+            if (p1_idx + 1) < p2_idx:
+                pointer += 1
+                tmp = tmp_all[pointer]
+                predict_gps.extend(tmp[0])
+                predict_ids.extend(tmp[1])
+            predict_ids.append(seg)
+            predict_gps.append(latlng)
+        outputs2 = outputs2[num:]
 
-        test_id_recall = np.mean(epoch_recall_loss) if len(epoch_recall_loss) > 0 else 0
-        test_id_precision = np.mean(epoch_precision_loss) if len(epoch_precision_loss) > 0 else 0
-        test_id_f1 = np.mean(epoch_f1_loss) if len(epoch_f1_loss) > 0 else 0
-        test_id_acc = np.mean(epoch_id1_loss) if len(epoch_id1_loss) > 0 else 0
-        test_mae = np.mean(epoch_mae_loss) if len(epoch_mae_loss) > 0 else 0
-        test_rmse = np.mean(epoch_rmse_loss) if len(epoch_rmse_loss) > 0 else 0
-        print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
+        mm_gps_seq = []
+        mm_eids = []
+        for pt in traj.pt_list:
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(candi_pt.eid)
+            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+        assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
+        results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
+    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
 
-        logging.info('Time: ' + str(epoch_secs) + 's')
-        logging.info('\tTest RID Acc:' + str(test_id_acc) +
-                     '\tTest RID Recall:' + str(test_id_recall) +
-                     '\tTest RID Precision:' + str(test_id_precision) +
-                     '\tTest RID F1 Score:' + str(test_id_f1) +
-                     '\tTest MAE Loss:' + str(test_mae) +
-                     '\tTest RMSE Loss:' + str(test_rmse))
+    print('==> Starting Evaluation...')
+    epoch_id1_loss = []
+    epoch_recall_loss = []
+    epoch_precision_loss = []
+    epoch_f1_loss = []
+    epoch_mae_loss = []
+    epoch_rmse_loss = []
+    for pred_gps, pred_seg, trg_gps, trg_id in results:
+        recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
+        epoch_id1_loss.append(loss_ids1)
+        epoch_recall_loss.append(recall)
+        epoch_precision_loss.append(precision)
+        epoch_f1_loss.append(f1)
+        epoch_mae_loss.append(loss_mae)
+        epoch_rmse_loss.append(loss_rmse)
 
-        test_trajs = test_dataset.trajs
-        groups = Counter(test_dataset.groups)
-        nums = []
-        for i in range(len(test_trajs)):
-            nums.append(groups[i])
+    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
+    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
+    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
+    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
+    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
+    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
+    print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
 
-        outputs2 = outputs.copy()
-        results = []
-        for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
-            tmp_all = outputs2[:num]
-            low_idx = traj.low_idx
-            gps, segs, _ = zip(*src_mm)
-            predict_ids = [segs[0]]
-            predict_gps = [gps[0]]
-            pointer = -1
-            for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
-                if (p1_idx + 1) < p2_idx:
-                    pointer += 1
-                    tmp = tmp_all[pointer]
-                    predict_gps.extend(tmp[0])
-                    predict_ids.extend(tmp[1])
-                predict_ids.append(seg)
-                predict_gps.append(latlng)
-            outputs2 = outputs2[num:]
-
-            mm_gps_seq = []
-            mm_eids = []
-            for pt in traj.pt_list:
-                candi_pt = pt.data['candi_pt']
-                mm_eids.append(candi_pt.eid)
-                mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
-            assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
-            results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
-
-        pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
+    logging.info('Time: ' + str(epoch_secs) + 's')
+    logging.info('\tTest RID Acc:' + str(test_id_acc) +
+                 '\tTest RID Recall:' + str(test_id_recall) +
+                 '\tTest RID Precision:' + str(test_id_precision) +
+                 '\tTest RID F1 Score:' + str(test_id_f1) +
+                 '\tTest MAE Loss:' + str(test_mae) +
+                 '\tTest RMSE Loss:' + str(test_rmse))
 
 if __name__ == '__main__':
     main()
