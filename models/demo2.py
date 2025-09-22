@@ -433,8 +433,6 @@ class E2ETrajTestData(Dataset):
 
         self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
 
-        self.trajs = trajs
-
         self.src_grid_seqs, self.src_gps_seqs, self.src_pro_feas = [], [], []
         self.trg_rids, self.trg_rates = [], []
         self.src_seg_seq, self.src_seg_feats = [], []
@@ -558,6 +556,39 @@ class E2ETrajTestData(Dataset):
             mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
             mm_rates.append([candi_pt.rate])
         return mm_eids, mm_rates
+
+    def build_selector_candidates(self, ls_candi, trg_id_seq):
+        candi_id = []
+        candi_feat = []
+        candi_onehot = []
+        candi_mask = []
+        for candis, trg in zip(ls_candi, trg_id_seq):
+            candi_mask.append([1] * len(candis) + [0] * (self.parameters.candi_size - len(candis)))
+            tmp_id = []
+            tmp_feat = []
+            tmp_onehot = [0] * self.parameters.candi_size
+            for candi in candis:
+                tmp_id.append(candi.eid)
+                tmp_feat.append([
+                    getattr(candi, 'err_weight', getattr(candi, 'error', 0.0)),
+                    getattr(candi, 'cosv', 0.0),
+                    getattr(candi, 'cosv_pre', 0.0),
+                    getattr(candi, 'cosf', 0.0),
+                    getattr(candi, 'cosl', 0.0),
+                    getattr(candi, 'cos1', 0.0),
+                    getattr(candi, 'cos2', 0.0),
+                    getattr(candi, 'cos3', 0.0),
+                    getattr(candi, 'cosp', 0.0)
+                ])
+            tmp_id.extend([0] * (self.parameters.candi_size - len(candis)))
+            tmp_feat.extend([[0] * len(tmp_feat[0])] * (self.parameters.candi_size - len(candis)))
+            if trg in tmp_id:
+                idx = tmp_id.index(trg)
+                tmp_onehot[idx] = 1
+            candi_id.append(tmp_id)
+            candi_feat.append(tmp_feat)
+            candi_onehot.append(tmp_onehot)
+        return candi_onehot, candi_id, candi_feat, candi_mask
 
 
 # ==================== 选择器分支 ====================

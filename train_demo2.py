@@ -52,9 +52,9 @@ def collate_fn(batch):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
