@@ -2,6 +2,7 @@ import os
 import pickle
 import random
 
+from tqdm import tqdm
 import numpy as np
 import time
 import torch
@@ -10,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import torch.nn.utils.rnn as rnn_utils
 
-from models.layers import Attention, GPSFormer, GRFormer, sequence_mask, sequence_mask3d
+from models.layers import Attention, GPSFormer, GRFormer, sequence_mask, sequence_mask3d, Encoder
 from utils.model_utils import gps2grid, get_normalized_t, AttrDict
 from utils.spatial_func import SPoint, project_pt_to_road, rate2gps
 from utils.trajectory_func import STPoint
@@ -19,245 +20,6 @@ from preprocess import SparseDAM, SegInfo
 import networkx as nx
 import datetime as dt
 from queue import Queue
-
-
-# ==================== 数据集（端到端） ====================
-
-class E2ETrajData(Dataset):
-    """
-    端到端训练数据集：按低频点对之间的 gap 构造样本，
-    同时返回候选集与标签，保证两端输入齐备并可端到端训练。
-    """
-
-    def __init__(self, rn, trajs_dir, mbr, parameters, mode):
-        self.parameters = parameters
-        self.rn = rn
-        self.mbr = mbr  # MBR of all trajectories
-        self.grid_size = parameters.grid_size
-        self.time_span = parameters.time_span
-        self.mode = mode
-        self.keep_ratio = parameters.keep_ratio
-        if mode == 'train':
-            # 训练阶段从 init_ratio 开始，便于后续按 decay_ratio 衰减到 keep_ratio
-            self.keep_ratio = getattr(parameters, 'init_ratio', parameters.keep_ratio)
-
-        if mode == 'train':
-            file = os.path.join(trajs_dir, 'train.pkl')
-        elif mode == 'valid':
-            file = os.path.join(trajs_dir, 'valid.pkl')
-        elif mode == 'test':
-            file = os.path.join(trajs_dir, 'test_output.pkl')
-        else:
-            raise NotImplementedError
-        trajs = pickle.load(open(file, "rb"))
-        if parameters.small and mode == 'train':
-            idx_group = 0
-            num_group = 5
-            num_k = len(trajs) // num_group
-            trajs = trajs[num_k * idx_group: num_k * (idx_group + 1)]
-        self.trajs = trajs
-
-        # 非训练阶段：初始化路径规划器，避免使用真值子路径作为先验
-        self.dam = None
-        if self.mode != 'train':
-            self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
-
-        # 为与最终输出一致：在非 train 模式下，预先构建 groups 与 src_mms
-        self.groups = []
-        self.src_mms = []
-        if self.mode != 'train':
-            for serial, traj in enumerate(self.trajs):
-                low_idx = traj.low_idx
-                src_list = np.array(traj.pt_list, dtype=object)
-                src_list = src_list[low_idx].tolist()
-
-                # 低频观测点的匹配结果 (gps, seg, rate)
-                src_mm = []
-                for pt in src_list:
-                    candi_pt = pt.data['candi_pt']
-                    src_mm.append([[candi_pt.lat, candi_pt.lng], candi_pt.eid, candi_pt.rate])
-                self.src_mms.append(src_mm)
-
-                # 记录该轨迹的 gap 数量（每个 gap 对应一个样本）
-                for p1_idx, p2_idx in zip(low_idx[:-1], low_idx[1:]):
-                    if (p1_idx + 1) < p2_idx:
-                        self.groups.append(serial)
-
-    def __len__(self):
-        return len(self.trajs)
-
-    def __getitem__(self, index):
-        traj = self.trajs[index]
-
-        if self.mode == 'train':
-            length = len(traj.pt_list)
-            keep_index = [0] + sorted(random.sample(range(1, length - 1), int((length - 2) * self.keep_ratio))) + [length - 1]
-        else:
-            keep_index = traj.low_idx
-        src_list = np.array(traj.pt_list, dtype=object)
-        src_list = src_list[keep_index].tolist()
-
-        trg_list = traj.pt_list
-
-        data = []
-        for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], keep_index[:-1], src_list[1:], keep_index[1:]):
-            
-            if (p1_idx + 1) < p2_idx:
-                tmp_src_list = [p1, p2]
-
-                # 基础序列：
-                ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self._get_src_seq(tmp_src_list)
-                features = self._get_pro_features(tmp_src_list, hours)
-
-                # 候选生成：对两个端点生成候选集（9维候选特征）
-                trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
-                candi_onehot, candi_ids, candi_feats, candi_masks = self._build_selector_candidates(trg_candis, tmp_seg_seq)
-
-                # 目标路段序列与速率（完整高频序列的映射）
-                mm_eids, mm_rates = self._get_trg_seq(trg_list[p1_idx: p2_idx + 1])
-                # 先验路径：训练用真值子路径；验证/测试用规划路径，避免泄露
-                if self.mode == 'train':
-                    path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
-                else:
-                    s1, s2 = tmp_seg_seq[0], tmp_seg_seq[1]
-                    ts = getattr(p1, 'time', None)
-                    path = self.dam.planning_multi([s1, s2], ts, mode=self.parameters.planner)
-
-                da_route = [self.rn.valid_edge_one[item] for item in path]
-                src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
-                src_seg_feat = self._get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
-                # 为避免在验证/测试阶段将端点真值段作为输入特征造成泄露，直接置零
-                if self.mode != 'train':
-                    src_seg_seq = [0] * len(src_seg_seq)
-                    src_seg_feat = [[0.0] for _ in src_seg_feat]
-                label = self._get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
-
-                # 打包张量
-                da_route = torch.tensor(da_route)
-                src_grid_seq = torch.tensor(ls_grid_seq)
-                src_pro_fea = torch.tensor(features)
-                src_seg_seq = torch.tensor(src_seg_seq)
-                src_seg_feat = torch.tensor(src_seg_feat)
-
-                trg_rid = torch.tensor(mm_eids)
-                trg_rate = torch.tensor(mm_rates)
-                label = torch.tensor(label, dtype=torch.float32)
-                d_rid = trg_rid[-1]
-                d_rate = trg_rate[-1]
-
-                # 候选与标签
-                candi_onehot = torch.tensor(candi_onehot)
-                candi_ids = torch.tensor(candi_ids) + 1  # 与 MMA 一致：+1 避免0索引
-                candi_feats = torch.tensor(candi_feats)
-                candi_masks = torch.tensor(candi_masks, dtype=torch.float32)
-
-                # 返回顺序：先基础字段，再追加候选相关字段，便于 collate 对齐
-                data.append([
-                    da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_rid, trg_rate, label, d_rid, d_rate,
-                    candi_onehot, candi_ids, candi_feats, candi_masks
-                ])
-
-        return data
-
-    # ======== 工具函数 ========
-
-    def _get_src_seg_feat(self, gps_seq, seg_seq):
-        feats = []
-        for ds_pt, seg in zip(gps_seq, seg_seq):
-            gps = SPoint(ds_pt[0], ds_pt[1])
-            candi = self.rn.pt2seg(gps, seg)
-            feats.append([candi.rate])
-        return feats
-
-    def _get_src_seq(self, ds_pt_list):
-        hours = []
-        ls_grid_seq = []
-        ls_gps_seq = []
-        first_pt = ds_pt_list[0]
-        time_interval = self.time_span
-        seg_seq = []
-        for ds_pt in ds_pt_list:
-            hours.append(ds_pt.time_arr.hour)
-            t = get_normalized_t(first_pt, ds_pt, time_interval)
-            ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
-            if self.parameters.gps_flag:
-                locgrid_xid = (ds_pt.lat - self.rn.minLat) / (self.rn.maxLat - self.rn.minLat)
-                locgrid_yid = (ds_pt.lng - self.rn.minLon) / (self.rn.maxLon - self.rn.minLon)
-            else:
-                locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
-            ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
-            seg_seq.append(ds_pt.data['candi_pt'].eid)
-
-        return ls_grid_seq, ls_gps_seq, hours, seg_seq
-
-    def _get_trg_seq(self, tmp_pt_list):
-        mm_eids = []
-        mm_rates = []
-        for pt in tmp_pt_list:
-            candi_pt = pt.data['candi_pt']
-            mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
-            mm_rates.append([candi_pt.rate])
-        return mm_eids, mm_rates
-
-    def _get_label(self, cpath, trg_rid):
-        label = []
-        pre_rid = -1
-        pre_prob = []
-        for rid in trg_rid:
-            if rid == pre_rid:
-                tmp = pre_prob
-            else:
-                idx = 0
-                if rid in cpath:
-                    idx = cpath.index(rid)
-                tmp = [0] * len(cpath)
-                tmp[idx] = 1
-                pre_rid = rid
-                pre_prob = tmp
-            label.append(tmp)
-        return label
-
-    def _get_pro_features(self, ds_pt_list, hours):
-        hour = np.bincount(hours).argmax()
-        week = ds_pt_list[0].time_arr.weekday()
-        if week in [5, 6]:
-            hour += 24
-        return hour
-
-    def _build_selector_candidates(self, ls_candi, trg_id_seq):
-        """构造候选集张量与 one-hot 标签（对齐 top-k 候选）。"""
-        candi_id = []
-        candi_feat = []
-        candi_onehot = []
-        candi_mask = []
-        for candis, trg in zip(ls_candi, trg_id_seq):
-            candi_mask.append([1] * len(candis) + [0] * (self.parameters.candi_size - len(candis)))
-            tmp_id = []
-            tmp_feat = []
-            tmp_onehot = [0] * self.parameters.candi_size
-            for candi in candis:
-                tmp_id.append(candi.eid)
-                tmp_feat.append([
-                    getattr(candi, 'err_weight', getattr(candi, 'error', 0.0)),
-                    getattr(candi, 'cosv', 0.0),
-                    getattr(candi, 'cosv_pre', 0.0),
-                    getattr(candi, 'cosf', 0.0),
-                    getattr(candi, 'cosl', 0.0),
-                    getattr(candi, 'cos1', 0.0),
-                    getattr(candi, 'cos2', 0.0),
-                    getattr(candi, 'cos3', 0.0),
-                    getattr(candi, 'cosp', 0.0)
-                ])
-            tmp_id.extend([0] * (self.parameters.candi_size - len(candis)))
-            tmp_feat.extend([[0] * len(tmp_feat[0])] * (self.parameters.candi_size - len(candis)))
-            if trg in tmp_id:
-                idx = tmp_id.index(trg)
-                tmp_onehot[idx] = 1
-            candi_id.append(tmp_id)
-            candi_feat.append(tmp_feat)
-            candi_onehot.append(tmp_onehot)
-        return candi_onehot, candi_id, candi_feat, candi_mask
-
 
 # ==================== 规划器 ====================
 
@@ -269,6 +31,17 @@ def get_num_pts(time_span, time_interval):
         num_pts = time_span // time_interval - 1
     return num_pts
 
+def remove_circle(path_fixed):
+    cur = 0
+    while cur < len(path_fixed):
+        eid = path_fixed[cur]
+        idx = []
+        for i in range(cur, len(path_fixed)):
+            if path_fixed[i] == eid:
+                idx.append(i)
+        path_fixed = path_fixed[0: cur] + path_fixed[max(idx): ]
+        cur += 1
+    return path_fixed
 
 def calc_cos_value(vec1, vec2):
     vec1 = np.array(vec1, dtype=float)
@@ -378,7 +151,7 @@ class DAPlanner(object):
                     except nx.exception.NetworkXNoPath:
                         self.no_path_cnt += 1
                         route = [o, d]
-                route = self.remove_circle(route)
+                route = remove_circle(route)
             elif mode == 'time':
                 try:
                     _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="time")
@@ -450,17 +223,342 @@ class DAPlanner(object):
         t_r = (time_arr.minute * 60 + time_arr.second) * 1.0 / 3600
         return int(idx), t_r
 
-    def remove_circle(self, path_fixed):
-        cur = 0
-        while cur < len(path_fixed):
-            eid = path_fixed[cur]
-            idx = []
-            for i in range(cur, len(path_fixed)):
-                if path_fixed[i] == eid:
-                    idx.append(i)
-            path_fixed = path_fixed[0: cur] + path_fixed[max(idx): ]
-            cur += 1
-        return path_fixed
+
+
+# ==================== 数据集（端到端） ====================
+
+class E2ETrajData(Dataset):
+    """
+    端到端训练数据集：按低频点对之间的 gap 构造样本，
+    同时返回候选集与标签，保证两端输入齐备并可端到端训练。
+    """
+
+    def __init__(self, rn, trajs_dir, mbr, parameters, mode):
+        self.parameters = parameters
+        self.rn = rn
+        self.mbr = mbr  # MBR of all trajectories
+        self.grid_size = parameters.grid_size
+        self.time_span = parameters.time_span
+        self.mode = mode
+        self.keep_ratio = parameters.keep_ratio
+
+        if mode == 'train':
+            file = os.path.join(trajs_dir, 'train.pkl')
+        elif mode == 'valid':
+            file = os.path.join(trajs_dir, 'valid.pkl')
+        else:
+            raise NotImplementedError
+        trajs = pickle.load(open(file, "rb"))
+        if parameters.small and mode == 'train':
+            idx_group = 0
+            num_group = 5
+            num_k = len(trajs) // num_group
+            trajs = trajs[num_k * idx_group: num_k * (idx_group + 1)]
+        self.trajs = trajs
+
+    def __len__(self):
+        return len(self.trajs)
+
+    def __getitem__(self, index):
+        traj = self.trajs[index]
+
+        if self.mode == 'train':
+            length = len(traj.pt_list)
+            keep_index = [0] + sorted(random.sample(range(1, length - 1), int((length - 2) * self.keep_ratio))) + [length - 1]
+        else:
+            keep_index = traj.low_idx
+        src_list = np.array(traj.pt_list, dtype=object)
+        src_list = src_list[keep_index].tolist()
+
+        trg_list = traj.pt_list
+
+        data = []
+        for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], keep_index[:-1], src_list[1:], keep_index[1:]):
+            
+            if (p1_idx + 1) < p2_idx:
+                tmp_src_list = [p1, p2]
+
+                # 基础序列：
+                ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self.get_src_seq(tmp_src_list)
+                features = get_pro_features(tmp_src_list, hours)
+
+                # 候选生成：对两个端点生成候选集（9维候选特征）
+                trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
+                candi_onehot, candi_ids, candi_feats, candi_masks = self.build_selector_candidates(trg_candis, tmp_seg_seq)
+
+                # 目标路段序列与速率（完整高频序列的映射）
+                mm_eids, mm_rates = self.get_trg_seq(trg_list[p1_idx: p2_idx + 1])
+                # 训练/验证阶段均用真值子路径（与 TRMMA 统一）
+                path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
+
+                da_route = [self.rn.valid_edge_one[item] for item in path]
+                src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
+                src_seg_feat = self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
+                label = get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
+
+                # 打包张量
+                da_route = torch.tensor(da_route)
+                src_grid_seq = torch.tensor(ls_grid_seq)
+                src_pro_fea = torch.tensor(features)
+                src_seg_seq = torch.tensor(src_seg_seq)
+                src_seg_feat = torch.tensor(src_seg_feat)
+
+                trg_rid = torch.tensor(mm_eids)
+                trg_rate = torch.tensor(mm_rates)
+                label = torch.tensor(label, dtype=torch.float32)
+                d_rid = trg_rid[-1]
+                d_rate = trg_rate[-1]
+
+                # 候选与标签
+                candi_onehot = torch.tensor(candi_onehot)
+                candi_ids = torch.tensor(candi_ids) + 1  # 与 MMA 一致：+1 避免0索引
+                candi_feats = torch.tensor(candi_feats)
+                candi_masks = torch.tensor(candi_masks, dtype=torch.float32)
+
+                # 返回顺序：先基础字段，再追加候选相关字段，便于 collate 对齐
+                data.append([
+                    da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_rid, trg_rate, label, d_rid, d_rate,
+                    candi_onehot, candi_ids, candi_feats, candi_masks
+                ])
+
+        return data
+
+    def get_src_seg_feat(self, gps_seq, seg_seq):
+        feats = []
+        for ds_pt, seg in zip(gps_seq, seg_seq):
+            gps = SPoint(ds_pt[0], ds_pt[1])
+            candi = self.rn.pt2seg(gps, seg)
+            feats.append([candi.rate])
+        return feats
+
+    def get_src_seq(self, ds_pt_list):
+        hours = []
+        ls_grid_seq = []
+        ls_gps_seq = []
+        first_pt = ds_pt_list[0]
+        time_interval = self.time_span
+        seg_seq = []
+        for ds_pt in ds_pt_list:
+            hours.append(ds_pt.time_arr.hour)
+            t = get_normalized_t(first_pt, ds_pt, time_interval)
+            ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
+            if self.parameters.gps_flag:
+                locgrid_xid = (ds_pt.lat - self.rn.minLat) / (self.rn.maxLat - self.rn.minLat)
+                locgrid_yid = (ds_pt.lng - self.rn.minLon) / (self.rn.maxLon - self.rn.minLon)
+            else:
+                locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
+            ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
+            seg_seq.append(ds_pt.data['candi_pt'].eid)
+
+        return ls_grid_seq, ls_gps_seq, hours, seg_seq
+
+    def get_trg_seq(self, tmp_pt_list):
+        mm_eids = []
+        mm_rates = []
+        for pt in tmp_pt_list:
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
+            mm_rates.append([candi_pt.rate])
+        return mm_eids, mm_rates
+
+    def build_selector_candidates(self, ls_candi, trg_id_seq):
+        candi_id = []
+        candi_feat = []
+        candi_onehot = []
+        candi_mask = []
+        for candis, trg in zip(ls_candi, trg_id_seq):
+            candi_mask.append([1] * len(candis) + [0] * (self.parameters.candi_size - len(candis)))
+            tmp_id = []
+            tmp_feat = []
+            tmp_onehot = [0] * self.parameters.candi_size
+            for candi in candis:
+                tmp_id.append(candi.eid)
+                tmp_feat.append([
+                    getattr(candi, 'err_weight', getattr(candi, 'error', 0.0)),
+                    getattr(candi, 'cosv', 0.0),
+                    getattr(candi, 'cosv_pre', 0.0),
+                    getattr(candi, 'cosf', 0.0),
+                    getattr(candi, 'cosl', 0.0),
+                    getattr(candi, 'cos1', 0.0),
+                    getattr(candi, 'cos2', 0.0),
+                    getattr(candi, 'cos3', 0.0),
+                    getattr(candi, 'cosp', 0.0)
+                ])
+            tmp_id.extend([0] * (self.parameters.candi_size - len(candis)))
+            tmp_feat.extend([[0] * len(tmp_feat[0])] * (self.parameters.candi_size - len(candis)))
+            if trg in tmp_id:
+                idx = tmp_id.index(trg)
+                tmp_onehot[idx] = 1
+            candi_id.append(tmp_id)
+            candi_feat.append(tmp_feat)
+            candi_onehot.append(tmp_onehot)
+        return candi_onehot, candi_id, candi_feat, candi_mask
+
+def get_label(cpath, trg_rid):
+    label = []
+    pre_rid = -1
+    pre_prob = []
+    for rid in trg_rid:
+        if rid == pre_rid:
+            tmp = pre_prob
+        else:
+            idx = 0
+            if rid in cpath:
+                idx = cpath.index(rid)
+
+            tmp = [0] * len(cpath)
+            tmp[idx] = 1
+
+            pre_rid = rid
+            pre_prob = tmp
+        label.append(tmp)
+    return label
+
+def get_pro_features(ds_pt_list, hours):
+    hour = np.bincount(hours).argmax()
+    week = ds_pt_list[0].time_arr.weekday()
+    if week in [5, 6]:
+        hour += 24
+    return hour
+
+
+class E2ETrajTestData(Dataset):
+
+    def __init__(self, rn, trajs_dir, mbr, parameters, mode='test'):
+        self.parameters = parameters
+        self.rn = rn
+        self.mbr = mbr
+        self.grid_size = parameters.grid_size
+        self.time_span = parameters.time_span
+
+        self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
+
+        self.trajs = trajs
+
+        self.src_grid_seqs, self.src_gps_seqs, self.src_pro_feas = [], [], []
+        self.trg_rids, self.trg_rates = [], []
+        self.src_seg_seq, self.src_seg_feats = [], []
+        self.routes, self.labels = [], []
+        self.d_rids, self.d_rates = [], []
+        self.candi_onehots, self.candi_ids, self.candi_feats, self.candi_masks = [], [], [], []
+        trajs = pickle.load(open(os.path.join(trajs_dir, 'test_output.pkl'), "rb"))
+
+        self.groups = []  
+        self.src_mms = []  
+        for serial, traj in tqdm(enumerate(trajs), desc='traj num'):
+            low_idx = traj.low_idx
+            src_list = np.array(traj.pt_list, dtype=object)
+            src_list = src_list[low_idx].tolist()
+
+            # 低频点的匹配结果
+            src_mm = []
+            for pt in src_list:
+                candi_pt = pt.data['candi_pt']
+                src_mm.append([[candi_pt.lat, candi_pt.lng], candi_pt.eid, candi_pt.rate])
+            self.src_mms.append(src_mm)
+
+            for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], low_idx[:-1], src_list[1:], low_idx[1:]):
+                if (p1_idx + 1) < p2_idx:
+                    self.groups.append(serial)
+
+                    tmp_src_list = [p1, p2]
+                    ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self.get_src_seq(tmp_src_list)
+                    features = get_pro_features(tmp_src_list, hours)
+
+                    trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
+                    candi_onehot, candi_ids, candi_feats, candi_masks = self.build_selector_candidates(trg_candis, tmp_seg_seq)
+
+                    mm_eids, mm_rates = self.get_trg_seq(traj.pt_list[p1_idx: p2_idx + 1])
+
+                    s1, s2 = tmp_seg_seq[0], tmp_seg_seq[1]
+                    ts = getattr(p1, 'time', None)
+                    path = self.dam.planning_multi([s1, s2], ts, mode=self.parameters.planner)
+
+                    da_route = [self.rn.valid_edge_one[item] for item in path]
+                    src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
+                    src_seg_feat = self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
+                    label = get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
+
+                    self.routes.append(da_route)
+                    self.src_grid_seqs.append(ls_grid_seq)
+                    self.src_gps_seqs.append(ls_gps_seq)
+                    self.src_pro_feas.append(features)
+                    self.src_seg_seq.append(src_seg_seq)
+                    self.src_seg_feats.append(src_seg_feat)
+                    self.trg_rids.append(mm_eids)
+                    self.trg_rates.append(mm_rates)
+                    self.labels.append(label)
+                    self.d_rids.append(mm_eids[-1])
+                    self.d_rates.append(mm_rates[-1])
+                    self.candi_onehots.append(candi_onehot)
+                    self.candi_ids.append(candi_ids)
+                    self.candi_feats.append(candi_feats)
+                    self.candi_masks.append(candi_masks)
+
+    def __len__(self):
+        return len(self.src_grid_seqs)
+
+    def __getitem__(self, index):
+        da_route = torch.tensor(self.routes[index])
+        src_grid_seq = torch.tensor(self.src_grid_seqs[index])
+        src_pro_fea = torch.tensor(self.src_pro_feas[index])
+        src_seg_seq = torch.tensor(self.src_seg_seq[index])
+        src_seg_feat = torch.tensor(self.src_seg_feats[index])
+
+        trg_rid = torch.tensor(self.trg_rids[index])
+        trg_rate = torch.tensor(self.trg_rates[index])
+        label = torch.tensor(self.labels[index], dtype=torch.float32)
+        d_rid = torch.tensor(self.d_rids[index])
+        d_rate = torch.tensor(self.d_rates[index])
+
+        candi_onehot = torch.tensor(self.candi_onehots[index])
+        candi_ids = torch.tensor(self.candi_ids[index]) + 1
+        candi_feats = torch.tensor(self.candi_feats[index])
+        candi_masks = torch.tensor(self.candi_masks[index], dtype=torch.float32)
+
+        return [
+            da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat,
+            trg_rid, trg_rate, label, d_rid, d_rate,
+            candi_onehot, candi_ids, candi_feats, candi_masks
+        ]
+
+    def get_src_seg_feat(self, gps_seq, seg_seq):
+        feats = []
+        for ds_pt, seg in zip(gps_seq, seg_seq):
+            gps = SPoint(ds_pt[0], ds_pt[1])
+            candi = self.rn.pt2seg(gps, seg)
+            feats.append([candi.rate])
+        return feats
+
+    def get_src_seq(self, ds_pt_list):
+        hours = []
+        ls_grid_seq = []
+        ls_gps_seq = []
+        first_pt = ds_pt_list[0]
+        time_interval = self.time_span
+        seg_seq = []
+        for ds_pt in ds_pt_list:
+            hours.append(ds_pt.time_arr.hour)
+            t = get_normalized_t(first_pt, ds_pt, time_interval)
+            ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
+            if self.parameters.gps_flag:
+                locgrid_xid = (ds_pt.lat - self.rn.minLat) / (self.rn.maxLat - self.rn.minLat)
+                locgrid_yid = (ds_pt.lng - self.rn.minLon) / (self.rn.maxLon - self.rn.minLon)
+            else:
+                locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
+            ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
+            seg_seq.append(ds_pt.data['candi_pt'].eid)
+        return ls_grid_seq, ls_gps_seq, hours, seg_seq
+
+    def get_trg_seq(self, tmp_pt_list):
+        mm_eids = []
+        mm_rates = []
+        for pt in tmp_pt_list:
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
+            mm_rates.append([candi_pt.rate])
+        return mm_eids, mm_rates
+
 
 # ==================== 选择器分支 ====================
 
@@ -491,9 +589,6 @@ class SelectorEncoder(nn.Module):
         assert outputs.size(1) == max_src_len
         outputs = outputs * mask2d
         return outputs
-
-
-from models.layers import Encoder  # 复用同名 Encoder
 
 
 class SelectorHead(nn.Module):
@@ -534,6 +629,10 @@ class SelectorHead(nn.Module):
         self.init_weights()
 
     def init_weights(self):
+        """
+        Here we reproduce Keras default initialization weights for consistency with Keras version
+        Reference: https://github.com/vonfeng/DeepMove/blob/master/codes/model.py
+        """
         ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
         hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
         b = (param.data for name, param in self.named_parameters() if 'bias' in name)
@@ -793,13 +892,17 @@ class Reconstructor(nn.Module):
             self.encoder = GPSEncoder(parameters)
         self.decoder = DecoderMulti(parameters)
 
-        # forward 内阶段计时
-        self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []
-
         # 权重初始化
         self.init_weights()
 
+        # forward 内阶段计时
+        self.timer1, self.timer2, self.timer3, self.timer4, self.timer5, self.timer6 = [], [], [], [], [], []
+
     def init_weights(self):
+        """
+        Here we reproduce Keras default initialization weights for consistency with Keras version
+        Reference: https://github.com/vonfeng/DeepMove/blob/master/codes/model.py
+        """
         ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
         hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
         b = (param.data for name, param in self.named_parameters() if 'bias' in name)
@@ -864,8 +967,10 @@ class Reconstructor(nn.Module):
 
         final_outputs_id = outputs_id[1:-1]
         final_outputs_rate = outputs_rate[1:-1]
+
+        t5 = time.time()
         self.timer5.append(time.time() - t4)
-        self.timer6.append(time.time() - t0)
+        self.timer6.append(t5 - t0)
         return final_outputs_id, final_outputs_rate
 
 
@@ -892,7 +997,7 @@ class End2EndModel(nn.Module):
                 pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
                 src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):
 
-        # 1) 选择器前向：两端点的候选概率分布
+        # 1) 选择器前向：两端点的候选概率分布（已 masked softmax）
         sel_out_multi, sel_candi_vec, sel_probs = self.selector(sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks)
         # 软段嵌入（概率加权和），形状 [bs, src_len, hid]
         soft_seg_emb = (sel_probs.unsqueeze(-1) * sel_candi_vec).sum(dim=-2)
@@ -921,15 +1026,18 @@ class E2ELoss(nn.Module):
         self.lambda_selector = lambda_selector
         self.lambda_id = lambda_id
         self.lambda_rate = lambda_rate
+        
         self.crit_selector = nn.BCELoss(reduction='mean')
         self.crit_id = nn.BCELoss(reduction='sum')
         self.crit_rate = nn.L1Loss(reduction='sum')
+        self.eps = 1e-9
 
     def forward(self, outputs, labels, lengths):
 
-        selector_probs = outputs['selector_probs']  # [bs, 2, k]
-        selector_onehot = labels['selector_onehot'].float()  # [bs, 2, k]
-        loss_selector = self.crit_selector(selector_probs, selector_onehot) * selector_probs.shape[-1]
+        selector_probs = outputs['selector_probs']  # [bs, src_len, k]
+        selector_onehot = labels['selector_onehot'].float()  # [bs, src_len, k]
+        
+        loss_selector = self.crit_selector(selector_probs, selector_onehot) * selector_onehot.shape[-1]
 
         out_ids = outputs['out_ids']       # [trg_len-2, bs, da_len]
         out_rates = outputs['out_rates']   # [trg_len-2, bs, 1]
@@ -939,11 +1047,11 @@ class E2ELoss(nn.Module):
         trg_lengths = lengths['trg_lengths']
         da_lengths = lengths['da_lengths']
         trg_lengths_sub = [length - 2 for length in trg_lengths]
-        denom_id = np.sum(np.array(trg_lengths_sub) * np.array(da_lengths))
-        denom_id = max(1, denom_id)
         denom_rate = max(1, sum(trg_lengths_sub))
 
-        loss_id = self.crit_id(out_ids, trg_labels) * self.lambda_id / denom_id
+        
+        loss_id = self.crit_id(out_ids, trg_labels) * self.lambda_id / np.sum(np.array(trg_lengths_sub) * np.array(da_lengths))
+
         loss_rate = self.crit_rate(out_rates, trg_rates) * self.lambda_rate / denom_rate
 
         total = self.lambda_selector * loss_selector + loss_id + loss_rate

@@ -14,12 +14,12 @@ import torch.nn.functional as F
 from utils.map import RoadNetworkMapFull
 from utils.spatial_func import SPoint
 from utils.mbr import MBR
-from models.demo2 import DAPlanner, E2ETrajData
+from models.demo2 import DAPlanner, E2ETrajTestData
 from utils.model_utils import AttrDict, gps2grid
 import numpy as np
 from collections import Counter
 
-from train_demo2 import collate_fn, infer
+from train_demo2 import collate_fn_test, infer
 
 
 def main():
@@ -34,7 +34,7 @@ def main():
     parser.add_argument('--epochs', type=int, default=50, help='epochs')
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
-    parser.add_argument('--transformer_layers', type=int, default=2)
+    parser.add_argument('--transformer_layers', type=int, default=4)
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
@@ -43,7 +43,6 @@ def main():
     parser.add_argument('--attn_flag', action='store_true', default=True)
     parser.add_argument("--candi_size", type=int, default=10)
     parser.add_argument('--num_worker', type=int, default=8)
-    parser.add_argument('--init_ratio', type=float, default=0.5)
     parser.add_argument('--only_direction', action='store_true')
     parser.add_argument('--da_route_flag', action='store_true', default=True)
     parser.add_argument('--srcseg_flag', action='store_true', default=True)
@@ -163,7 +162,6 @@ def main():
         'direction_flag': opts.direction_flag,
         'attn_flag': opts.attn_flag,
         'candi_size': opts.candi_size,
-        'init_ratio': opts.init_ratio,
         'only_direction': opts.only_direction
     }
     args.update(args_dict)
@@ -180,11 +178,11 @@ def main():
 
     traj_root = os.path.join("data", args.city)
 
-    test_dataset = E2ETrajData(rn, traj_root, mbr, args, 'test')
+    test_dataset = E2ETrajTestData(rn, traj_root, mbr, args, 'test')
     print('testing dataset shape: ' + str(len(test_dataset)))
     logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
-    test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn, num_workers=opts.num_worker, pin_memory=True)
+    test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=collate_fn_test, num_workers=opts.num_worker, pin_memory=True)
 
     model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
     print('==> Model Loaded')
