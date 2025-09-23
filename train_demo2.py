@@ -35,7 +35,7 @@ def collate_fn(batch):
 
     src_lengths = [len(seq) for seq in src_seqs]
     src_seqs = rnn_utils.pad_sequence(src_seqs, batch_first=True, padding_value=0)
-    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1)
+    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1).long()
     src_seg_seqs = rnn_utils.pad_sequence(src_seg_seqs, batch_first=True, padding_value=0)
     src_seg_feats = rnn_utils.pad_sequence(src_seg_feats, batch_first=True, padding_value=0)
     trg_lengths = [len(seq) for seq in trg_rids]
@@ -52,9 +52,9 @@ def collate_fn(batch):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
@@ -70,16 +70,14 @@ def collate_fn(batch):
 
 
 def collate_fn_test(batch):
-    data = []
-    for item in batch:
-        data.extend(item)
-
+    # 测试集的 __getitem__ 返回单样本（14 个字段）的列表，这里不要展平，直接按 batch 聚合
     da_routes, src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, trg_rids, trg_rates, \
-    trg_rid_labels, d_rids, d_rates, candi_labels, candi_ids, candi_feats, candi_masks = zip(*data)
+    trg_rid_labels, d_rids, d_rates, candi_labels, candi_ids, candi_feats, candi_masks = zip(*batch)
 
     src_lengths = [len(seq) for seq in src_seqs]
     src_seqs = rnn_utils.pad_sequence(src_seqs, batch_first=True, padding_value=0)
-    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1)
+    # 可能为 0 维张量（标量），使用 stack 聚合到 [bs]，供 embedding 使用
+    src_pro_feas = torch.stack(src_pro_feas).long()
     src_seg_seqs = rnn_utils.pad_sequence(src_seg_seqs, batch_first=True, padding_value=0)
     src_seg_feats = rnn_utils.pad_sequence(src_seg_feats, batch_first=True, padding_value=0)
     trg_lengths = [len(seq) for seq in trg_rids]
@@ -90,15 +88,16 @@ def collate_fn_test(batch):
     da_routes = rnn_utils.pad_sequence(da_routes, batch_first=True, padding_value=0)
     da_pos = [torch.tensor(list(range(1, item + 1))) for item in da_lengths]
     da_pos = rnn_utils.pad_sequence(da_pos, batch_first=True, padding_value=0)
-    d_rids = torch.vstack(d_rids).squeeze(-1)
+    # 末端 rid 为标量，使用 stack 聚合
+    d_rids = torch.stack(d_rids)
     d_rates = torch.vstack(d_rates)
     max_da = max(da_lengths)
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
@@ -374,7 +373,7 @@ def main():
     parser.add_argument('--direction_flag', action='store_true', default=True)
     parser.add_argument('--attn_flag', action='store_true', default=True)
     parser.add_argument("--candi_size", type=int, default=10)
-    parser.add_argument('--num_worker', type=int, default=4)
+    parser.add_argument('--num_worker', type=int, default=8)
     parser.add_argument('--only_direction', action='store_true')
     parser.add_argument('--da_route_flag', action='store_true', default=True)
     parser.add_argument('--srcseg_flag', action='store_true', default=True)

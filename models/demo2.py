@@ -273,22 +273,21 @@ class E2ETrajData(Dataset):
         trg_list = traj.pt_list
 
         data = []
+
+        # 统一为按 gap 生成子样本的逻辑（与 trmma 一致），同时保留 demo2 的候选分支
         for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], keep_index[:-1], src_list[1:], keep_index[1:]):
-            
             if (p1_idx + 1) < p2_idx:
                 tmp_src_list = [p1, p2]
 
-                # 基础序列：
                 ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self.get_src_seq(tmp_src_list)
                 features = get_pro_features(tmp_src_list, hours)
 
-                # 候选生成：对两个端点生成候选集（9维候选特征）
+                # 候选（针对该 gap 的两个低频点）
                 trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
                 candi_onehot, candi_ids, candi_feats, candi_masks = self.build_selector_candidates(trg_candis, tmp_seg_seq)
 
-                # 目标路段序列与速率（完整高频序列的映射）
+                # 目标高频序列（该 gap 间的完整映射）
                 mm_eids, mm_rates = self.get_trg_seq(trg_list[p1_idx: p2_idx + 1])
-                # 训练/验证阶段均用真值子路径（与 TRMMA 统一）
                 path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
 
                 da_route = [self.rn.valid_edge_one[item] for item in path]
@@ -311,13 +310,14 @@ class E2ETrajData(Dataset):
 
                 # 候选与标签
                 candi_onehot = torch.tensor(candi_onehot)
-                candi_ids = torch.tensor(candi_ids) + 1  # 与 MMA 一致：+1 避免0索引
+                candi_ids = torch.tensor(candi_ids) + 1
                 candi_feats = torch.tensor(candi_feats)
                 candi_masks = torch.tensor(candi_masks, dtype=torch.float32)
 
                 # 返回顺序：先基础字段，再追加候选相关字段，便于 collate 对齐
                 data.append([
-                    da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_rid, trg_rate, label, d_rid, d_rate,
+                    da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat,
+                    trg_rid, trg_rate, label, d_rid, d_rate,
                     candi_onehot, candi_ids, candi_feats, candi_masks
                 ])
 
@@ -1061,7 +1061,6 @@ class E2ELoss(nn.Module):
         self.crit_selector = nn.BCELoss(reduction='mean')
         self.crit_id = nn.BCELoss(reduction='sum')
         self.crit_rate = nn.L1Loss(reduction='sum')
-        self.eps = 1e-9
 
     def forward(self, outputs, labels, lengths):
 
@@ -1078,7 +1077,7 @@ class E2ELoss(nn.Module):
         trg_lengths = lengths['trg_lengths']
         da_lengths = lengths['da_lengths']
         trg_lengths_sub = [length - 2 for length in trg_lengths]
-        denom_rate = max(1, sum(trg_lengths_sub))
+        denom_rate = sum(trg_lengths_sub)
 
         
         loss_id = self.crit_id(out_ids, trg_labels) * self.lambda_id / np.sum(np.array(trg_lengths_sub) * np.array(da_lengths))
