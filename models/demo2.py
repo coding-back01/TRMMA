@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 import torch.nn.utils.rnn as rnn_utils
 
-from models.layers import Attention, GPSFormer, GRFormer, sequence_mask, sequence_mask3d, Encoder
+from models.layers_demo2 import GPSFormer, GRFormer, sequence_mask, sequence_mask3d, Encoder, AttentionDemo2
 from utils.model_utils import gps2grid, get_normalized_t, AttrDict
 from utils.spatial_func import SPoint, project_pt_to_road, rate2gps
 from utils.trajectory_func import STPoint
@@ -643,7 +643,7 @@ class SelectorHead(nn.Module):
 
         mlp_dim = parameters.hid_dim * 2
         if self.attn_flag:
-            self.attn = Attention(parameters.hid_dim)
+            self.attn = AttentionDemo2(parameters.hid_dim)
             mlp_dim += parameters.hid_dim
 
         self.prob_out = nn.Sequential(
@@ -805,7 +805,7 @@ class DecoderMulti(nn.Module):
                 rnn_input_dim += 1
 
         self.rnn = nn.GRU(rnn_input_dim, parameters.hid_dim)
-        self.attn_route = Attention(parameters.hid_dim)
+        self.attn_route = AttentionDemo2(parameters.hid_dim)
         if self.rate_flag:
             fc_rate_out_input_dim = parameters.hid_dim + parameters.hid_dim
             self.fc_rate_out = nn.Sequential(

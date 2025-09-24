@@ -52,9 +52,9 @@ def collate_fn(batch):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
@@ -95,9 +95,9 @@ def collate_fn_test(batch):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
@@ -217,6 +217,7 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
     epoch_rate_loss = 0
 
     model.eval()
+    
     with torch.no_grad():
         for i, batch in enumerate(iterator):
             src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths, \
@@ -335,7 +336,7 @@ def infer(model, iterator, rid_features_dict, device):
             out_ids = outputs['out_ids']
             out_rates = outputs['out_rates']
 
-            output_tmp = (F.one_hot(out_ids.argmax(-1), da_routes.shape[0]) * da_routes.permute(1, 0).unsqueeze(1).repeat(1, out_ids.shape[0], 1).permute(1, 0, 2)).sum(dim=-1)
+            output_tmp = (F.one_hot(out_ids.argmax(-1), da_routes.shape[0]) * da_routes.permute(1, 0).unsqueeze(1).repeat(1, trg_rid_labels.shape[0], 1).permute(1, 0, 2)).sum(dim=-1)
 
             output_rates = out_rates.squeeze(2)
             gt_rates = trg_rates.squeeze(2)
@@ -593,7 +594,7 @@ def main():
         if args.decay_flag:
             args.tf_ratio = args.tf_ratio * args.decay_ratio
 
-        scheduler.step(valid_id)
+        scheduler.step(valid_loss)
         lr_last = lr
         lr = optimizer.param_groups[0]['lr']
 
@@ -673,7 +674,7 @@ def main():
     epoch_f1_loss = []
     epoch_mae_loss = []
     epoch_rmse_loss = []
-    for pred_gps, pred_seg, trg_gps, trg_id in results:
+    for pred_gps, pred_seg, trg_gps, trg_id in outputs:
         recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
         epoch_id1_loss.append(loss_ids1)
         epoch_recall_loss.append(recall)
