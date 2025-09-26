@@ -52,9 +52,9 @@ def collate_fn(batch):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
 
     candi_labels = rnn_utils.pad_sequence(candi_labels, batch_first=True, padding_value=0)
     candi_ids = rnn_utils.pad_sequence(candi_ids, batch_first=True, padding_value=0)
@@ -70,17 +70,18 @@ def collate_fn(batch):
 
 
 def collate_fn_test(batch):
-    # 测试集的 __getitem__ 返回单样本（14 个字段）的列表，这里不要展平，直接按 batch 聚合
-    da_routes, src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, trg_rids, trg_rates, \
+    # 测试集的 __getitem__ 返回单样本（15 个字段）的列表，这里不要展平，直接按 batch 聚合
+    da_routes, src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, trg_gps_seqs, trg_rids, trg_rates, \
     trg_rid_labels, d_rids, d_rates, candi_labels, candi_ids, candi_feats, candi_masks = zip(*batch)
 
     src_lengths = [len(seq) for seq in src_seqs]
     src_seqs = rnn_utils.pad_sequence(src_seqs, batch_first=True, padding_value=0)
     # 可能为 0 维张量（标量），使用 stack 聚合到 [bs]，供 embedding 使用
-    src_pro_feas = torch.stack(src_pro_feas).long()
+    src_pro_feas = torch.vstack(src_pro_feas).squeeze(-1).long()
     src_seg_seqs = rnn_utils.pad_sequence(src_seg_seqs, batch_first=True, padding_value=0)
     src_seg_feats = rnn_utils.pad_sequence(src_seg_feats, batch_first=True, padding_value=0)
-    trg_lengths = [len(seq) for seq in trg_rids]
+    trg_lengths = [len(seq) for seq in trg_gps_seqs]
+    trg_gps_seqs = rnn_utils.pad_sequence(trg_gps_seqs, batch_first=True, padding_value=0)
     trg_rids = rnn_utils.pad_sequence(trg_rids, batch_first=True, padding_value=0)
     trg_rates = rnn_utils.pad_sequence(trg_rates, batch_first=True, padding_value=0)
 
@@ -88,8 +89,8 @@ def collate_fn_test(batch):
     da_routes = rnn_utils.pad_sequence(da_routes, batch_first=True, padding_value=0)
     da_pos = [torch.tensor(list(range(1, item + 1))) for item in da_lengths]
     da_pos = rnn_utils.pad_sequence(da_pos, batch_first=True, padding_value=0)
-    # 末端 rid 为标量，使用 stack 聚合
-    d_rids = torch.stack(d_rids)
+    # 末端 rid 处理，与训练时保持一致
+    d_rids = torch.vstack(d_rids).squeeze(-1)
     d_rates = torch.vstack(d_rates)
     max_da = max(da_lengths)
     trg_rid_labels = list(trg_rid_labels)
@@ -106,7 +107,7 @@ def collate_fn_test(batch):
 
     return (
         src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths,
-        trg_rids, trg_rates, trg_lengths, trg_rid_labels,
+        trg_gps_seqs, trg_rids, trg_rates, trg_lengths, trg_rid_labels,
         da_routes, da_lengths, da_pos, d_rids, d_rates,
         candi_labels, candi_ids, candi_feats, candi_masks
     )
@@ -137,15 +138,10 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         da_routes, da_lengths, da_pos, d_rids, d_rates, \
         candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-        sel_src_seqs = src_seqs.to(device, non_blocking=True)
-        sel_src_lens = src_lengths
-        sel_candi_ids = candi_ids.to(device, non_blocking=True)
-        sel_candi_feats = candi_feats.to(device, non_blocking=True)
-        sel_candi_masks = candi_masks.to(device, non_blocking=True)
-
+        # 统一处理GPS数据，和TRMMA保持一致
         src_pro_feas = src_pro_feas.to(device, non_blocking=True)
         trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-        src_seqs_tr = sel_src_seqs.permute(1, 0, 2)  # [src_len, bs, 3]
+        src_seqs = src_seqs.permute(1, 0, 2).to(device, non_blocking=True)  # [src_len, bs, 3] - 和TRMMA一致
         trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
         trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
         src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
@@ -154,15 +150,20 @@ def train(model, iterator, optimizer, criterion, rid_features_dict, parameters, 
         da_pos = da_pos.permute(1, 0).to(device, non_blocking=True)
         d_rids = d_rids.to(device, non_blocking=True)
         d_rates = d_rates.to(device, non_blocking=True)
+        
+        # Selector专用数据
+        sel_candi_ids = candi_ids.to(device, non_blocking=True)
+        sel_candi_feats = candi_feats.to(device, non_blocking=True)
+        sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
         time_move += time.time() - t1
         t2 = time.time()
 
         outputs = model(
-            sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
-            src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
+            src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
             src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
-            src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=parameters.tf_ratio
+            src_seg_seqs, src_seg_feats, d_rids, d_rates, parameters.tf_ratio,
+            sel_candi_ids, sel_candi_feats, sel_candi_masks
         )
 
         time_forward += time.time() - t2
@@ -225,15 +226,9 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
             da_routes, da_lengths, da_pos, d_rids, d_rates, \
             candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-            sel_src_seqs = src_seqs.to(device, non_blocking=True)
-            sel_src_lens = src_lengths
-            sel_candi_ids = candi_ids.to(device, non_blocking=True)
-            sel_candi_feats = candi_feats.to(device, non_blocking=True)
-            sel_candi_masks = candi_masks.to(device, non_blocking=True)
-
             src_pro_feas = src_pro_feas.to(device, non_blocking=True)
             trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-            src_seqs_tr = sel_src_seqs.permute(1, 0, 2)
+            src_seqs = src_seqs.permute(1, 0, 2).to(device, non_blocking=True)  # [src_len, bs, 3] - 和TRMMA一致
             trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
             trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
 
@@ -244,12 +239,17 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
 
             src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
             src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
+            
+            # Selector专用数据
+            sel_candi_ids = candi_ids.to(device, non_blocking=True)
+            sel_candi_feats = candi_feats.to(device, non_blocking=True)
+            sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
             outputs = model(
-                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
-                src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
+                src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
                 src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
-                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=0
+                src_seg_seqs, src_seg_feats, d_rids, d_rates, 0,
+                sel_candi_ids, sel_candi_feats, sel_candi_masks
             )
 
             labels = {
@@ -274,20 +274,26 @@ def evaluate(model, iterator, criterion, rid_features_dict, parameters, device):
     return epoch_ttl_loss / len(iterator), epoch_selector_loss / len(iterator), epoch_id_loss / len(iterator), epoch_rate_loss / len(iterator)
 
 
-def get_results(predict_id, predict_rate, target_id, target_rate, trg_len, routes, route_lengths):
+def get_results(predict_id, predict_rate, target_id, target_rate, target_gps, trg_len, routes, route_lengths, inverse_flag=True):
+
+    if inverse_flag:
+        predict_id = predict_id - 1
+        target_id = target_id - 1
+        routes = routes - 1
 
     predict_id = predict_id.permute(1, 0).detach().cpu().tolist()
     predict_rate = predict_rate.permute(1, 0).detach().cpu().tolist()
+    target_gps = target_gps.permute(1, 0, 2).detach().cpu().tolist()
     target_id = target_id.permute(1, 0).detach().cpu().tolist()
     target_rate = target_rate.permute(1, 0).detach().cpu().tolist()
     routes = routes.permute(1, 0).detach().cpu().tolist()
 
     results = []
-    for pred_seg, pred_rate, trg_id, trg_rate, length, route, route_len in zip(
-            predict_id, predict_rate, target_id, target_rate, trg_len, routes, route_lengths):
+    for pred_seg, pred_rate, trg_id, trg_rate, trg_gps, length, route, route_len in zip(
+            predict_id, predict_rate, target_id, target_rate, target_gps, trg_len, routes, route_lengths):
         results.append([
             pred_seg[:length], pred_rate[:length],
-            trg_id[:length], trg_rate[:length],
+            trg_id[:length], trg_rate[:length], trg_gps[:length],
             route[:route_len]
         ])
     return results
@@ -300,19 +306,13 @@ def infer(model, iterator, rid_features_dict, device):
     with torch.no_grad():
         for i, batch in enumerate(iterator):
             src_seqs, src_pro_feas, src_seg_seqs, src_seg_feats, src_lengths, \
-            trg_rids, trg_rates, trg_lengths, trg_rid_labels, \
+            trg_gps_seqs, trg_rids, trg_rates, trg_lengths, trg_rid_labels, \
             da_routes, da_lengths, da_pos, d_rids, d_rates, \
             candi_onehots, candi_ids, candi_feats, candi_masks = batch
 
-            sel_src_seqs = src_seqs.to(device, non_blocking=True)
-            sel_src_lens = src_lengths
-            sel_candi_ids = candi_ids.to(device, non_blocking=True)
-            sel_candi_feats = candi_feats.to(device, non_blocking=True)
-            sel_candi_masks = candi_masks.to(device, non_blocking=True)
-
             src_pro_feas = src_pro_feas.to(device, non_blocking=True)
             trg_rid_labels = trg_rid_labels.permute(1, 0, 2).to(device, non_blocking=True)
-            src_seqs_tr = sel_src_seqs.permute(1, 0, 2)
+            src_seqs = src_seqs.permute(1, 0, 2).to(device, non_blocking=True)  # [src_len, bs, 3] - 和TRMMA一致
             trg_rids = trg_rids.permute(1, 0).long().to(device, non_blocking=True)
             trg_rates = trg_rates.permute(1, 0, 2).to(device, non_blocking=True)
 
@@ -323,27 +323,30 @@ def infer(model, iterator, rid_features_dict, device):
 
             src_seg_seqs = src_seg_seqs.permute(1, 0).to(device, non_blocking=True)
             src_seg_feats = src_seg_feats.permute(1, 0, 2).to(device, non_blocking=True)
+            
+            # Selector专用数据
+            sel_candi_ids = candi_ids.to(device, non_blocking=True)
+            sel_candi_feats = candi_feats.to(device, non_blocking=True)
+            sel_candi_masks = candi_masks.to(device, non_blocking=True)
 
             outputs = model(
-                # selector
-                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
-                # reconstructor
-                src_seqs_tr, src_lengths, trg_rids, trg_rates, trg_lengths,
+                src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
                 src_pro_feas, rid_features_dict, da_routes, da_lengths, da_pos,
-                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio=-1
+                src_seg_seqs, src_seg_feats, d_rids, d_rates, -1,
+                sel_candi_ids, sel_candi_feats, sel_candi_masks
             )
 
             out_ids = outputs['out_ids']
             out_rates = outputs['out_rates']
-
             output_tmp = (F.one_hot(out_ids.argmax(-1), da_routes.shape[0]) * da_routes.permute(1, 0).unsqueeze(1).repeat(1, trg_rid_labels.shape[0], 1).permute(1, 0, 2)).sum(dim=-1)
 
             output_rates = out_rates.squeeze(2)
             gt_rates = trg_rates.squeeze(2)
+            trg_gps_seqs = trg_gps_seqs.permute(1, 0, 2)
             trg_lengths_sub = [length - 2 for length in trg_lengths]
 
             results = get_results(
-                output_tmp, output_rates, trg_rids[1:-1], gt_rates[1:-1],
+                output_tmp, output_rates, trg_rids[1:-1], gt_rates[1:-1], trg_gps_seqs[1:-1],
                 trg_lengths_sub, da_routes, da_lengths
             )
             data.extend(results)
@@ -371,6 +374,8 @@ def main():
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
     parser.add_argument('--small', action='store_true')
+    parser.add_argument('--eid_cate', type=str, default='gps2seg')
+    parser.add_argument('--inferred_seg_path', type=str, default='')  # 推断分段路径，字符串类型，默认空
     parser.add_argument('--direction_flag', action='store_true', default=True)
     parser.add_argument('--attn_flag', action='store_true', default=True)
     parser.add_argument("--candi_size", type=int, default=10)
@@ -378,7 +383,7 @@ def main():
     parser.add_argument('--only_direction', action='store_true')
     parser.add_argument('--da_route_flag', action='store_true', default=True)
     parser.add_argument('--srcseg_flag', action='store_true', default=True)
-    parser.add_argument('--gps_flag', action='store_true', default=True)
+    parser.add_argument('--gps_flag', action='store_true', default=False) 
     parser.add_argument('--planner', type=str, default='da')
 
     opts = parser.parse_args()
@@ -490,6 +495,8 @@ def main():
         'utc': utc,
         'small': opts.small,
         'dam_root': os.path.join("data", opts.city),
+        'eid_cate': opts.eid_cate,
+        'inferred_seg_path': opts.inferred_seg_path,  # 推断段路径
         'planner': opts.planner,
         'direction_flag': opts.direction_flag,
         'attn_flag': opts.attn_flag,
@@ -610,7 +617,7 @@ def main():
     logging.info('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
     print('==> Training Time: {}, {}, {}, {}'.format(np.sum(train_times) / 3600, np.mean(train_times), np.min(train_times), np.max(train_times)))
 
-    test_dataset = E2ETrajTestData(rn, traj_root, mbr, args, 'test')
+    test_dataset = E2ETrajTestData(rn, traj_root, mbr, args)
     print('testing dataset shape: ' + str(len(test_dataset)))
     logging.info('testing dataset shape: ' + str(len(test_dataset)))
 
@@ -627,47 +634,51 @@ def main():
     print('Time: ' + str(epoch_secs) + 's')
     logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
     print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
-    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
+    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
 
     outputs = []
-    for pred_seg, pred_rate, trg_id, trg_rate, route in data:
+    for pred_seg, pred_rate, trg_id, trg_rate, trg_gps, route in data:
         pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
-        trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
         outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
 
     test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
     groups = Counter(test_dataset.groups)
-    nums = [groups[i] for i in range(len(test_trajs))]
-    outputs2 = outputs.copy()
-    results = []
-    for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
-        tmp_all = outputs2[:num]
-        low_idx = traj.low_idx
-        gps, segs, _ = zip(*src_mm)
-        predict_ids = [segs[0]]
-        predict_gps = [gps[0]]
-        pointer = -1
-        for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
-            if (p1_idx + 1) < p2_idx:
-                pointer += 1
-                tmp = tmp_all[pointer]
-                predict_gps.extend(tmp[0])
-                predict_ids.extend(tmp[1])
-            predict_ids.append(seg)
-            predict_gps.append(latlng)
-        outputs2 = outputs2[num:]
+    nums = []
+    for i in range(len(test_trajs)):
+        nums.append(groups[i])
+    # results = []
+    # for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
+    #     tmp_all = outputs[:num]
+    #     low_idx = traj.low_idx
+    #     gps, segs, _ = zip(*src_mm)
+    #     predict_ids = [segs[0]]
+    #     predict_gps = [gps[0]]
+    #     # predict_ids = []
+    #     # predict_gps = []
+    #     pointer = -1
+    #     for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
+    #         if (p1_idx + 1) < p2_idx:
+    #             pointer += 1
+    #             tmp = tmp_all[pointer]
+    #             predict_gps.extend(tmp[0])
+    #             predict_ids.extend(tmp[1])
+    #         predict_ids.append(seg)
+    #         predict_gps.append(latlng)
+    #     outputs = outputs[num:]
 
-        mm_gps_seq = []
-        mm_eids = []
-        for pt in traj.pt_list:
-            candi_pt = pt.data['candi_pt']
-            mm_eids.append(candi_pt.eid)
-            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
-        assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
-        results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
-    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
+    #     mm_gps_seq = []
+    #     mm_eids = []
+    #     for i, pt in enumerate(traj.pt_list):
+    #         candi_pt = pt.data['candi_pt']
+    #         mm_eids.append(candi_pt.eid)
+    #         # if i not in low_idx:
+    #         mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+    #     assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
+    #     results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
+    # pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
     
     print('==> Starting Evaluation...')
+
     epoch_id1_loss = []
     epoch_recall_loss = []
     epoch_precision_loss = []
@@ -683,12 +694,7 @@ def main():
         epoch_mae_loss.append(loss_mae)
         epoch_rmse_loss.append(loss_rmse)
 
-    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
-    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
-    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
-    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
-    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
-    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
+    test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse = np.mean(epoch_recall_loss), np.mean(epoch_precision_loss), np.mean(epoch_f1_loss), np.mean(epoch_id1_loss), np.mean(epoch_mae_loss), np.mean(epoch_rmse_loss)
     print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
 
     logging.info('Time: ' + str(epoch_secs) + 's')

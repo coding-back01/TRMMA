@@ -424,7 +424,7 @@ def get_pro_features(ds_pt_list, hours):
 
 class E2ETrajTestData(Dataset):
 
-    def __init__(self, rn, trajs_dir, mbr, parameters, mode='test'):
+    def __init__(self, rn, trajs_dir, mbr, parameters):
         self.parameters = parameters
         self.rn = rn
         self.mbr = mbr
@@ -432,82 +432,115 @@ class E2ETrajTestData(Dataset):
         self.time_span = parameters.time_span
 
         self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
+        if parameters.eid_cate == 'gps2seg' and parameters.inferred_seg_path and os.path.exists(parameters.inferred_seg_path):
+            inferred_segs = pickle.load(open(parameters.inferred_seg_path, "rb"))
+            predict_id, _ = zip(*inferred_segs)
+        elif parameters.eid_cate in ['mm', 'nn']:
+            seg_file_path = os.path.join(trajs_dir, "test_{}_eids.pkl".format(parameters.eid_cate))
+            if os.path.exists(seg_file_path):
+                predict_id = pickle.load(open(seg_file_path, "rb"))
+            else:
+                predict_id = []
+        else:
+            predict_id = []
 
         self.src_grid_seqs, self.src_gps_seqs, self.src_pro_feas = [], [], []
-        self.trg_rids, self.trg_rates = [], []
-        self.src_seg_seq, self.src_seg_feats = [], []
-        self.routes, self.labels = [], []
+        self.trg_gps_seqs, self.trg_rids, self.trg_rates = [], [], []
+        self.src_seg_seq = []
+        self.src_seg_feats = []
+        self.routes = []
+        self.labels = []
         self.d_rids, self.d_rates = [], []
         self.candi_onehots, self.candi_ids, self.candi_feats, self.candi_masks = [], [], [], []
         trajs = pickle.load(open(os.path.join(trajs_dir, 'test_output.pkl'), "rb"))
 
-        self.groups = []  
-        self.src_mms = []  
+        self.groups = []
+        self.src_mms = []
         for serial, traj in tqdm(enumerate(trajs), desc='traj num'):
-            low_idx = traj.low_idx
+            trg_list = traj.pt_list.copy()
             src_list = np.array(traj.pt_list, dtype=object)
-            src_list = src_list[low_idx].tolist()
+            src_list = src_list[traj.low_idx].tolist()
 
-            # 低频点的匹配结果
+            _, src_gps_seq, _, seg_seq, time_seq = self.get_src_seq(src_list)
+            if parameters.eid_cate in ['mm', 'nn', 'gps2seg'] and predict_id:
+                seg_seq = predict_id[serial]
             src_mm = []
-            for pt in src_list:
-                candi_pt = pt.data['candi_pt']
-                src_mm.append([[candi_pt.lat, candi_pt.lng], candi_pt.eid, candi_pt.rate])
+            for seg, (lat, lng) in zip(seg_seq, src_gps_seq):
+                projected, rate, dist = project_pt_to_road(self.rn, SPoint(lat, lng), seg)
+                src_mm.append([[projected.lat, projected.lng], seg, rate])
             self.src_mms.append(src_mm)
-
-            for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], low_idx[:-1], src_list[1:], low_idx[1:]):
+            
+            for p1, p1_idx, p2, p2_idx, s1, s2, ts, mmf1, mmf2 in zip(src_list[:-1], traj.low_idx[:-1], src_list[1:], traj.low_idx[1:], seg_seq[:-1], seg_seq[1:], time_seq[:-1], src_mm[:-1], src_mm[1:]):
                 if (p1_idx + 1) < p2_idx:
-                    self.groups.append(serial)
-
+                    tmp_seg_seq = [s1, s2]
                     tmp_src_list = [p1, p2]
-                    ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self.get_src_seq(tmp_src_list)
+
+                    ls_grid_seq, ls_gps_seq, hours, _, _ = self.get_src_seq(tmp_src_list)
                     features = get_pro_features(tmp_src_list, hours)
 
                     trg_candis = self.rn.get_trg_segs(ls_gps_seq, self.parameters.candi_size, self.parameters.search_dist, self.parameters.beta)
                     candi_onehot, candi_ids, candi_feats, candi_masks = self.build_selector_candidates(trg_candis, tmp_seg_seq)
 
-                    mm_eids, mm_rates = self.get_trg_seq(traj.pt_list[p1_idx: p2_idx + 1])
+                    mm_gps_seq, mm_eids, mm_rates = self.get_trg_seq(trg_list[p1_idx: p2_idx + 1])
+                    path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
 
-                    s1, s2 = tmp_seg_seq[0], tmp_seg_seq[1]
-                    ts = getattr(p1, 'time', None)
-                    path = self.dam.planning_multi([s1, s2], ts, mode=self.parameters.planner)
+                    if parameters.eid_cate in ['mm', 'nn', 'gps2seg']:
+                        s1, s2 = tmp_seg_seq[0], tmp_seg_seq[1]
+                        ts = getattr(p1, 'time', None)
+                        path = self.dam.planning_multi([s1, s2], ts, mode=self.parameters.planner)
+                        mm_gps_seq[0] = mmf1[0]
+                        mm_eids[0] = self.rn.valid_edge_one[mmf1[1]]
+                        mm_rates[0] = [mmf1[2]]
+                        mm_gps_seq[-1] = mmf2[0]
+                        mm_eids[-1] = self.rn.valid_edge_one[mmf2[1]]
+                        mm_rates[-1] = [mmf2[2]]
 
-                    da_route = [self.rn.valid_edge_one[item] for item in path]
-                    src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
-                    src_seg_feat = self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
-                    label = get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
+                    self.routes.append([self.rn.valid_edge_one[item] for item in path])
+                    self.src_seg_seq.append([self.rn.valid_edge_one[item] for item in tmp_seg_seq])
+                    self.src_seg_feats.append(self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq))
+                    self.labels.append(get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1]))
 
-                    self.routes.append(da_route)
+                    self.trg_gps_seqs.append(mm_gps_seq)
+                    self.trg_rids.append(mm_eids)
+                    self.trg_rates.append(mm_rates)
                     self.src_grid_seqs.append(ls_grid_seq)
                     self.src_gps_seqs.append(ls_gps_seq)
                     self.src_pro_feas.append(features)
-                    self.src_seg_seq.append(src_seg_seq)
-                    self.src_seg_feats.append(src_seg_feat)
-                    self.trg_rids.append(mm_eids)
-                    self.trg_rates.append(mm_rates)
-                    self.labels.append(label)
                     self.d_rids.append(mm_eids[-1])
                     self.d_rates.append(mm_rates[-1])
                     self.candi_onehots.append(candi_onehot)
                     self.candi_ids.append(candi_ids)
                     self.candi_feats.append(candi_feats)
                     self.candi_masks.append(candi_masks)
+                    self.groups.append(serial)
 
     def __len__(self):
         return len(self.src_grid_seqs)
 
     def __getitem__(self, index):
-        da_route = torch.tensor(self.routes[index])
-        src_grid_seq = torch.tensor(self.src_grid_seqs[index])
-        src_pro_fea = torch.tensor(self.src_pro_feas[index])
-        src_seg_seq = torch.tensor(self.src_seg_seq[index])
-        src_seg_feat = torch.tensor(self.src_seg_feats[index])
+        src_grid_seq = self.src_grid_seqs[index]
+        trg_gps_seq = self.trg_gps_seqs[index]
+        trg_rid = self.trg_rids[index]
+        trg_rate = self.trg_rates[index]
+        da_route = self.routes[index]
 
-        trg_rid = torch.tensor(self.trg_rids[index])
-        trg_rate = torch.tensor(self.trg_rates[index])
-        label = torch.tensor(self.labels[index], dtype=torch.float32)
-        d_rid = torch.tensor(self.d_rids[index])
-        d_rate = torch.tensor(self.d_rates[index])
+        label = self.labels[index]
+        label = torch.tensor(label, dtype=torch.float32)
+
+        src_seg_seq = self.src_seg_seq[index]
+        src_seg_feat = self.src_seg_feats[index]
+        src_seg_seq = torch.tensor(src_seg_seq)
+        src_seg_feat = torch.tensor(src_seg_feat)
+
+        src_grid_seq = torch.tensor(src_grid_seq)
+        trg_gps_seq = torch.tensor(trg_gps_seq)
+        trg_rid = torch.tensor(trg_rid)
+        trg_rate = torch.tensor(trg_rate)
+        src_pro_fea = torch.tensor(self.src_pro_feas[index])
+        da_route = torch.tensor(da_route)
+
+        d_rid = trg_rid[-1]
+        d_rate = trg_rate[-1]
 
         candi_onehot = torch.tensor(self.candi_onehots[index])
         candi_ids = torch.tensor(self.candi_ids[index]) + 1
@@ -515,7 +548,7 @@ class E2ETrajTestData(Dataset):
         candi_masks = torch.tensor(self.candi_masks[index], dtype=torch.float32)
 
         return [
-            da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat,
+            da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_gps_seq,
             trg_rid, trg_rate, label, d_rid, d_rate,
             candi_onehot, candi_ids, candi_feats, candi_masks
         ]
@@ -529,6 +562,7 @@ class E2ETrajTestData(Dataset):
         return feats
 
     def get_src_seq(self, ds_pt_list):
+        timestamps = []
         hours = []
         ls_grid_seq = []
         ls_gps_seq = []
@@ -536,6 +570,7 @@ class E2ETrajTestData(Dataset):
         time_interval = self.time_span
         seg_seq = []
         for ds_pt in ds_pt_list:
+            timestamps.append(ds_pt.time)
             hours.append(ds_pt.time_arr.hour)
             t = get_normalized_t(first_pt, ds_pt, time_interval)
             ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
@@ -546,16 +581,18 @@ class E2ETrajTestData(Dataset):
                 locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
             ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
             seg_seq.append(ds_pt.data['candi_pt'].eid)
-        return ls_grid_seq, ls_gps_seq, hours, seg_seq
+        return ls_grid_seq, ls_gps_seq, hours, seg_seq, timestamps
 
     def get_trg_seq(self, tmp_pt_list):
+        mm_gps_seq = []
         mm_eids = []
         mm_rates = []
         for pt in tmp_pt_list:
             candi_pt = pt.data['candi_pt']
+            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
             mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
             mm_rates.append([candi_pt.rate])
-        return mm_eids, mm_rates
+        return mm_gps_seq, mm_eids, mm_rates
 
     def build_selector_candidates(self, ls_candi, trg_id_seq):
         candi_id = []
@@ -693,7 +730,7 @@ class SelectorHead(nn.Module):
 
         output_multi = encoder_outputs.unsqueeze(-2).repeat(1, 1, candi_num, 1)
         outputs_id = self.prob_out(torch.cat((output_multi, candi_vec), dim=-1)).squeeze(-1)
-        outputs_id = outputs_id.masked_fill(candi_masks == 0, 0)
+        outputs_id = outputs_id.masked_fill(candi_masks == 0, 0)  
 
         return output_multi, candi_vec, outputs_id
 
@@ -1021,12 +1058,16 @@ class End2EndModel(nn.Module):
         self.reconstructor = Reconstructor(args)
 
     def forward(self,
-                # 选择器输入
-                sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks,
-                # 重建器输入
+                # 统一GPS输入 (像TRMMA一样)
                 src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
                 pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
-                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio):
+                src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio,
+                # 选择器专用输入
+                sel_candi_ids, sel_candi_feats, sel_candi_masks):
+
+        # GPS数据形状处理：src_seqs应该是[src_len, bs, 3]，需要转换为[bs, src_len, 3]给selector
+        sel_src_seqs = src_seqs.permute(1, 0, 2)  # [bs, src_len, 3]
+        sel_src_lens = src_lengths
 
         # 1) 选择器前向：两端点的候选概率分布（已 masked softmax）
         sel_out_multi, sel_candi_vec, sel_probs = self.selector(sel_src_seqs, sel_src_lens, sel_candi_ids, sel_candi_feats, sel_candi_masks)
@@ -1035,7 +1076,7 @@ class End2EndModel(nn.Module):
         # 转换为重建器期望的 [src_len, bs, hid]
         soft_seg_emb = soft_seg_emb.permute(1, 0, 2)
 
-        # 2) 重建器前向：注入软嵌入
+        # 2) 重建器前向：注入软嵌入，直接使用原始GPS数据[src_len, bs, 3]
         out_ids, out_rates = self.reconstructor(src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,
                                                 pro_features, rid_features_dict, da_routes, da_lengths, da_pos,
                                                 src_seg_seqs, src_seg_feats, d_rids, d_rates, teacher_forcing_ratio,
@@ -1071,18 +1112,16 @@ class E2ELoss(nn.Module):
 
         out_ids = outputs['out_ids']       # [trg_len-2, bs, da_len]
         out_rates = outputs['out_rates']   # [trg_len-2, bs, 1]
-        trg_labels = labels['trg_labels']  # 已与模型输出对齐（中间步），不再裁剪
-        trg_rates = labels['trg_rates'][1:-1]               # [trg_len-2, bs, 1]
+        trg_labels = labels['trg_labels']  
+        trg_rates = labels['trg_rates'][1:-1]  
 
         trg_lengths = lengths['trg_lengths']
         da_lengths = lengths['da_lengths']
         trg_lengths_sub = [length - 2 for length in trg_lengths]
-        denom_rate = sum(trg_lengths_sub)
-
         
         loss_id = self.crit_id(out_ids, trg_labels) * self.lambda_id / np.sum(np.array(trg_lengths_sub) * np.array(da_lengths))
 
-        loss_rate = self.crit_rate(out_rates, trg_rates) * self.lambda_rate / denom_rate
+        loss_rate = self.crit_rate(out_rates, trg_rates) * self.lambda_rate / sum(trg_lengths_sub) 
 
         total = self.lambda_selector * loss_selector + loss_id + loss_rate
         return total, {'selector': loss_selector.item(), 'id': loss_id.item(), 'rate': loss_rate.item()}

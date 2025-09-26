@@ -178,7 +178,7 @@ def main():
 
     traj_root = os.path.join("data", args.city)
 
-    test_dataset = E2ETrajTestData(rn, traj_root, mbr, args, 'test')
+    test_dataset = E2ETrajTestData(rn, traj_root, mbr, args)
     print('testing dataset shape: ' + str(len(test_dataset)))
     logging.info('testing dataset shape: ' + str(len(test_dataset)))
 

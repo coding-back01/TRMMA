@@ -152,41 +152,34 @@ class Encoder(nn.Module):
         return self.norm(x)
 
 
-class AttentionDemo2(nn.Module):  # Demo2专用注意力机制
+class AttentionDemo2(nn.Module):
+    def __init__(self, hid_dim):
+        super().__init__()
+        self.hid_dim = hid_dim
+        self.temperature = nn.Parameter(torch.tensor(1.0))
 
-    def __init__(self, hid_dim):  # 初始化方法，传入隐藏层维度
-        super().__init__()  # 调用父类的初始化方法
-        self.hid_dim = hid_dim  # 保存隐藏层维度
+        self.attn = nn.Linear(self.hid_dim * 2, self.hid_dim)
+        self.v = nn.Linear(self.hid_dim, 1, bias=False)
+
+    def forward(self, query, key, value, attn_mask):
+        bs, src_len = query.shape[0], query.shape[1]
+        candi_num = key.shape[-2]
+        query = query.unsqueeze(-2).repeat(1, 1, candi_num, 1)
+
+        energy = torch.tanh(self.attn(torch.cat((query, key), dim=-1)))
+
+        attention = self.v(energy).squeeze(-1)
+        attention = attention.masked_fill(attn_mask == 0, -1e10)
         
-        # 温度参数，避免sigmoid输出过于极端，降低温度提高稳定性
-        self.temperature = 0.8
-
-        self.attn = nn.Linear(self.hid_dim * 2, self.hid_dim)  # 定义一个线性层，用于计算注意力能量
-        self.v = nn.Linear(self.hid_dim, 1, bias=False)  # 定义一个线性层，将能量映射为一个分数，不使用偏置
-
-    def forward(self, query, key, value, attn_mask):  # 前向传播方法，输入query、key、value和注意力mask
-        # query = [batch size, src len, hid dim]
-        # key = [batch size, src len, candi num, hid dim]
-        bs, src_len = query.shape[0], query.shape[1]  # 获取batch size和源序列长度
-        candi_num = key.shape[-2]  # 获取候选数量
-        # repeat decoder hidden state src_len times
-        query = query.unsqueeze(-2).repeat(1, 1, candi_num, 1)  # 扩展query维度并在candi_num维度上重复
-
-        energy = torch.tanh(self.attn(torch.cat((query, key), dim=-1)))  # 拼接query和key，经过线性层和tanh激活得到能量
-
-        attention = self.v(energy).squeeze(-1)  # 将能量通过线性层映射为注意力分数，并去掉最后一维
-        attention = attention.masked_fill(attn_mask == 0, -1e10)  # 使用mask将padding位置的分数设为极小值
+        temperature = torch.clamp(self.temperature, min=0.5, max=3.0)
+        scores = torch.sigmoid(attention / temperature)
+        scores = scores.masked_fill(attn_mask == 0, 0)
         
-        # Demo2专用修改：统一使用相同的attention分布
-        scores_raw = attention * self.temperature
-        scores_sigmoid = torch.sigmoid(scores_raw)
-        
-        # weighted计算也使用sigmoid归一化的权重，保持一致性
-        scores_normalized = scores_sigmoid / (scores_sigmoid.sum(dim=-1, keepdim=True) + 1e-8)
-        weighted = torch.bmm(scores_normalized.reshape(bs*src_len, candi_num).unsqueeze(-2), value.reshape(bs*src_len, candi_num, -1)).squeeze(-2)
+        scores_norm = F.softmax(attention.masked_fill(attn_mask == 0, -1e10), dim=-1)
+        weighted = torch.bmm(scores_norm.reshape(bs*src_len, candi_num).unsqueeze(-2), value.reshape(bs*src_len, candi_num, -1)).squeeze(-2)
         weighted = weighted.reshape(bs, src_len, -1)
-        
-        return scores_sigmoid, weighted
+
+        return scores, weighted
 
 
 class GPSLayer(nn.Module):
