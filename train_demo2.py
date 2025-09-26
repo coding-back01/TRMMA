@@ -646,36 +646,36 @@ def main():
     nums = []
     for i in range(len(test_trajs)):
         nums.append(groups[i])
-    # results = []
-    # for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
-    #     tmp_all = outputs[:num]
-    #     low_idx = traj.low_idx
-    #     gps, segs, _ = zip(*src_mm)
-    #     predict_ids = [segs[0]]
-    #     predict_gps = [gps[0]]
-    #     # predict_ids = []
-    #     # predict_gps = []
-    #     pointer = -1
-    #     for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
-    #         if (p1_idx + 1) < p2_idx:
-    #             pointer += 1
-    #             tmp = tmp_all[pointer]
-    #             predict_gps.extend(tmp[0])
-    #             predict_ids.extend(tmp[1])
-    #         predict_ids.append(seg)
-    #         predict_gps.append(latlng)
-    #     outputs = outputs[num:]
+    results = []
+    for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
+        tmp_all = outputs[:num]
+        low_idx = traj.low_idx
+        gps, segs, _ = zip(*src_mm)
+        predict_ids = [segs[0]]
+        predict_gps = [gps[0]]
+        # predict_ids = []
+        # predict_gps = []
+        pointer = -1
+        for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
+            if (p1_idx + 1) < p2_idx:
+                pointer += 1
+                tmp = tmp_all[pointer]
+                predict_gps.extend(tmp[0])
+                predict_ids.extend(tmp[1])
+            predict_ids.append(seg)
+            predict_gps.append(latlng)
+        outputs = outputs[num:]
 
-    #     mm_gps_seq = []
-    #     mm_eids = []
-    #     for i, pt in enumerate(traj.pt_list):
-    #         candi_pt = pt.data['candi_pt']
-    #         mm_eids.append(candi_pt.eid)
-    #         # if i not in low_idx:
-    #         mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
-    #     assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
-    #     results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
-    # pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
+        mm_gps_seq = []
+        mm_eids = []
+        for i, pt in enumerate(traj.pt_list):
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(candi_pt.eid)
+            # if i not in low_idx:
+            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+        assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
+        results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
+    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
     
     print('==> Starting Evaluation...')
 
@@ -685,7 +685,7 @@ def main():
     epoch_f1_loss = []
     epoch_mae_loss = []
     epoch_rmse_loss = []
-    for pred_gps, pred_seg, trg_gps, trg_id in outputs:
+    for pred_gps, pred_seg, trg_gps, trg_id in results:
         recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
         epoch_id1_loss.append(loss_ids1)
         epoch_recall_loss.append(recall)
