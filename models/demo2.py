@@ -1056,6 +1056,7 @@ class End2EndModel(nn.Module):
         super().__init__()
         self.selector = SelectorHead(args)
         self.reconstructor = Reconstructor(args)
+        self.disable_soft_seg_emb = getattr(args, 'disable_soft_seg_emb', False)
 
     def forward(self,
                 # 统一GPS输入 (像TRMMA一样)
@@ -1075,6 +1076,10 @@ class End2EndModel(nn.Module):
         soft_seg_emb = (sel_probs.unsqueeze(-1) * sel_candi_vec).sum(dim=-2)
         # 转换为重建器期望的 [src_len, bs, hid]
         soft_seg_emb = soft_seg_emb.permute(1, 0, 2)
+
+        # 根据开关禁用软段嵌入
+        if self.disable_soft_seg_emb:
+            soft_seg_emb = torch.zeros_like(soft_seg_emb)
 
         # 2) 重建器前向：注入软嵌入，直接使用原始GPS数据[src_len, bs, 3]
         out_ids, out_rates = self.reconstructor(src_seqs, src_lengths, trg_rids, trg_rates, trg_lengths,

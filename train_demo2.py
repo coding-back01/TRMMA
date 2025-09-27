@@ -385,6 +385,7 @@ def main():
     parser.add_argument('--srcseg_flag', action='store_true', default=True)
     parser.add_argument('--gps_flag', action='store_true', default=False) 
     parser.add_argument('--planner', type=str, default='da')
+    parser.add_argument('--disable_soft_seg_emb', action='store_true', help='disable soft segment embedding injection')
 
     opts = parser.parse_args()
     print(opts)
@@ -501,7 +502,8 @@ def main():
         'direction_flag': opts.direction_flag,
         'attn_flag': opts.attn_flag,
         'candi_size': opts.candi_size,
-        'only_direction': opts.only_direction
+        'only_direction': opts.only_direction,
+        'disable_soft_seg_emb': opts.disable_soft_seg_emb
     }
     args.update(args_dict)
 
