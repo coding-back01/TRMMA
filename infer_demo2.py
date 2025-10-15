@@ -46,8 +46,11 @@ def main():
     parser.add_argument('--only_direction', action='store_true')
     parser.add_argument('--da_route_flag', action='store_true', default=True)
     parser.add_argument('--srcseg_flag', action='store_true', default=True)
-    parser.add_argument('--gps_flag', action='store_true', default=True)
+    parser.add_argument('--gps_flag', action='store_true', default=False) 
     parser.add_argument('--planner', type=str, default='da')
+    parser.add_argument('--eid_cate', type=str, default='gps2seg')
+    parser.add_argument('--inferred_seg_path', type=str, default='')  # 推断分段路径，字符串类型，默认空
+    parser.add_argument('--disable_soft_seg_emb', action='store_true', help='disable soft segment embedding injection')
 
     opts = parser.parse_args()
     print(opts)
@@ -158,11 +161,14 @@ def main():
         'utc': utc,
         'small': opts.small,
         'dam_root': os.path.join("data", opts.city),
+        'eid_cate': opts.eid_cate,
+        'inferred_seg_path': opts.inferred_seg_path,  # 推断段路径
         'planner': opts.planner,
         'direction_flag': opts.direction_flag,
         'attn_flag': opts.attn_flag,
         'candi_size': opts.candi_size,
-        'only_direction': opts.only_direction
+        'only_direction': opts.only_direction,
+        'disable_soft_seg_emb': opts.disable_soft_seg_emb
     }
     args.update(args_dict)
 
@@ -195,25 +201,27 @@ def main():
     print('Time: ' + str(epoch_secs) + 's')
     logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
     print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / max(1, len(test_dataset)) * 1000, len(test_dataset) / max(1e-9, (end_time - start_time))))
-    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e.pkl'), "wb"))
+    pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
 
     outputs = []
-    for pred_seg, pred_rate, trg_id, trg_rate, route in data:
+    for pred_seg, pred_rate, trg_id, trg_rate, trg_gps, route in data:
         pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
-        trg_gps = toseq(rn, trg_id, trg_rate, route, dam.seg_info)
         outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
 
     test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
     groups = Counter(test_dataset.groups)
-    nums = [groups[i] for i in range(len(test_trajs))]
-    outputs2 = outputs.copy()
+    nums = []
+    for i in range(len(test_trajs)):
+        nums.append(groups[i])
     results = []
     for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
-        tmp_all = outputs2[:num]
+        tmp_all = outputs[:num]
         low_idx = traj.low_idx
         gps, segs, _ = zip(*src_mm)
         predict_ids = [segs[0]]
         predict_gps = [gps[0]]
+        # predict_ids = []
+        # predict_gps = []
         pointer = -1
         for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
             if (p1_idx + 1) < p2_idx:
@@ -223,19 +231,21 @@ def main():
                 predict_ids.extend(tmp[1])
             predict_ids.append(seg)
             predict_gps.append(latlng)
-        outputs2 = outputs2[num:]
+        outputs = outputs[num:]
 
         mm_gps_seq = []
         mm_eids = []
-        for pt in traj.pt_list:
+        for i, pt in enumerate(traj.pt_list):
             candi_pt = pt.data['candi_pt']
             mm_eids.append(candi_pt.eid)
+            # if i not in low_idx:
             mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
         assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
         results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
-    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e.pkl'), "wb"))
-
+    pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_e2e_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
+    
     print('==> Starting Evaluation...')
+
     epoch_id1_loss = []
     epoch_recall_loss = []
     epoch_precision_loss = []
@@ -251,12 +261,7 @@ def main():
         epoch_mae_loss.append(loss_mae)
         epoch_rmse_loss.append(loss_rmse)
 
-    test_id_recall = float(np.mean(epoch_recall_loss)) if len(epoch_recall_loss) > 0 else 0.0
-    test_id_precision = float(np.mean(epoch_precision_loss)) if len(epoch_precision_loss) > 0 else 0.0
-    test_id_f1 = float(np.mean(epoch_f1_loss)) if len(epoch_f1_loss) > 0 else 0.0
-    test_id_acc = float(np.mean(epoch_id1_loss)) if len(epoch_id1_loss) > 0 else 0.0
-    test_mae = float(np.mean(epoch_mae_loss)) if len(epoch_mae_loss) > 0 else 0.0
-    test_rmse = float(np.mean(epoch_rmse_loss)) if len(epoch_rmse_loss) > 0 else 0.0
+    test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse = np.mean(epoch_recall_loss), np.mean(epoch_precision_loss), np.mean(epoch_f1_loss), np.mean(epoch_id1_loss), np.mean(epoch_mae_loss), np.mean(epoch_rmse_loss)
     print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
 
     logging.info('Time: ' + str(epoch_secs) + 's')
@@ -266,6 +271,7 @@ def main():
                  '\tTest RID F1 Score:' + str(test_id_f1) +
                  '\tTest MAE Loss:' + str(test_mae) +
                  '\tTest RMSE Loss:' + str(test_rmse))
+
 
 if __name__ == '__main__':
     main()
