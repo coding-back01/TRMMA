@@ -1,0 +1,273 @@
+"""
+G-TRMMA推理脚本
+使用训练好的G-TRMMA模型进行轨迹恢复推理和评估
+"""
+
+from utils.evaluation_utils import calc_metrics, toseq
+import random
+import time
+import logging
+
+import os
+import argparse
+import pickle
+
+import torch
+from torch.utils.data import DataLoader
+import torch.profiler
+from utils.map import RoadNetworkMapFull
+from utils.spatial_func import SPoint
+from utils.mbr import MBR
+from models.gtrmma import DAPlanner, GTrajRecTestData
+from utils.model_utils import AttrDict, gps2grid
+import numpy as np
+from collections import Counter
+
+from train_gtrmma import collate_fn_test, infer
+
+
+def main():
+    parser = argparse.ArgumentParser(description='infer_G-TRMMA')
+    parser.add_argument('--city', type=str, default='porto')
+    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
+    parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')
+    parser.add_argument('--lambda1', type=int, default=10, help='weight for multi task id')
+    parser.add_argument('--lambda2', type=float, default=5, help='weight for multi task rate')
+    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
+    parser.add_argument('--epochs', type=int, default=30, help='epochs')
+    parser.add_argument('--batch_size', type=int, default=4)
+    parser.add_argument('--lr', type=float, default=1e-3)
+    parser.add_argument('--transformer_layers', type=int, default=2)
+    parser.add_argument('--gnn_layers', type=int, default=2, help='number of GNN layers')
+    parser.add_argument('--heads', type=int, default=4)
+    parser.add_argument("--gpu_id", type=str, default="0")
+    parser.add_argument('--model_old_path', type=str, default='', help='old model path')
+    parser.add_argument('--train_flag', action='store_true', help='flag of training')
+    parser.add_argument('--test_flag', action='store_true', help='flag of testing')
+    parser.add_argument('--small', action='store_true')
+    parser.add_argument('--eid_cate', type=str, default='gps2seg')
+    parser.add_argument('--inferred_seg_path', type=str, default='')
+    parser.add_argument('--srcseg_flag', action='store_true')
+    parser.add_argument('--gps_flag', action='store_true')
+    parser.add_argument('--debug', action='store_true')
+    parser.add_argument('--planner', type=str, default='da')
+    parser.add_argument('--num_worker', type=int, default=8)
+
+    opts = parser.parse_args()
+    print(opts)
+
+    device = torch.device(f"cuda:{opts.gpu_id}" if torch.cuda.is_available() else 'cpu')
+    print(f"Use GPU: cuda {opts.gpu_id}")
+
+    SEED = 42
+    random.seed(SEED)
+    np.random.seed(SEED)
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed(SEED)
+    torch.backends.cudnn.deterministic = True
+    print('device', device)
+
+    load_pretrained_flag = False
+    if opts.model_old_path != '':
+        model_save_path = opts.model_old_path
+        load_pretrained_flag = True
+    else:
+        raise ValueError("model path error - must provide model_old_path for inference")
+
+    logging.basicConfig(level=logging.DEBUG,
+                        format='%(asctime)s %(levelname)s %(message)s',
+                        filename=os.path.join(model_save_path, 'log.txt'),
+                        filemode='a')
+
+    city = opts.city
+    if city in ["PT", "porto", "porto1", "porto2", "porto3", "porto4", "porto5", "porto7", "porto9", "pt1", "pt3", "pt5", "pt10", "pt20", "pt40", "pt60", "pt80"]:
+        zone_range = [41.1395, -8.6911, 41.1864, -8.5521]
+        ts = 15
+        utc = 1
+    elif city in ["beijing", "beijing1", "beijing2", "beijing3", "beijing4", "beijing5", "beijing7", "beijing9", "bj1", "bj3", "bj5", "bj10", "bj20", "bj40", "bj60", "bj80"]:
+        zone_range = [39.7547, 116.1994, 40.0244, 116.5452]
+        ts = 60
+        utc = 0
+    elif city in ["chengdu", "chengdu1", "chengdu2", "chengdu3", "chengdu4", "chengdu5", "chengdu7", "chengdu9", "cd1", "cd3", "cd5", "cd10", "cd20", "cd40", "cd60", "cd80"]:
+        zone_range = [30.6443, 104.0288, 30.7416, 104.1375]
+        ts = 12
+        utc = 8
+    elif city in ["xian", "xian1", "xian2", "xian3", "xian4", "xian5", "xian7", "xian9", "xa1", "xa3", "xa5", "xa10", "xa20", "xa40", "xa60", "xa80"]:
+        zone_range = [34.2060, 108.9058, 34.2825, 109.0049]
+        ts = 12
+        utc = 8
+    else:
+        raise NotImplementedError
+
+    print('Preparing data...')
+    map_root = os.path.join("data", opts.city, "roadnet")
+    rn = RoadNetworkMapFull(map_root, zone_range=zone_range, unit_length=50)
+
+    args = AttrDict()
+    args_dict = {
+        'device': device,
+        'transformer_layers': opts.transformer_layers,
+        'gnn_layers': opts.gnn_layers,
+        'heads': opts.heads,
+        'tandem_fea_flag': True,
+        'pro_features_flag': True,
+        'srcseg_flag': opts.srcseg_flag,
+        'rate_flag': True,
+        'prog_flag': False,
+        'dest_type': 2,
+        'gps_flag': opts.gps_flag,
+        'rid_feats_flag': True,
+        'learn_pos': True,
+
+        # constraint
+        'search_dist': 50,
+        'beta': 15,
+        'gamma': 30,
+
+        # extra info module
+        'rid_fea_dim': 18,  # 1[norm length] + 8[way type] + 1[in degree] + 1[out degree]
+        'pro_input_dim': 48,  # 24[hour] + 1[holiday]
+        'pro_output_dim': 8,
+
+        # MBR
+        'min_lat': zone_range[0],
+        'min_lng': zone_range[1],
+        'max_lat': zone_range[2],
+        'max_lng': zone_range[3],
+
+        # input data params
+        'city': opts.city,
+        'keep_ratio': opts.keep_ratio,
+        'grid_size': 50,
+        'time_span': ts,
+
+        # model params
+        'hid_dim': opts.hid_dim,
+        'id_emb_dim': opts.hid_dim,
+        'dropout': 0.1,
+        'id_size': rn.valid_edge_cnt_one,
+
+        'lambda1': opts.lambda1,
+        'lambda2': opts.lambda2,
+        'n_epochs': opts.epochs,
+        'batch_size': opts.batch_size,
+        'learning_rate': opts.lr,
+        "lr_step": 2,
+        "lr_decay": 0.8,
+        'tf_ratio': opts.tf_ratio,
+        'decay_flag': True,
+        'decay_ratio': 0.9,
+        'clip': 1,
+        'log_step': 1,
+
+        'utc': utc,
+        'small': opts.small,
+        'dam_root': os.path.join("data", opts.city),
+        'eid_cate': opts.eid_cate,
+        'inferred_seg_path': opts.inferred_seg_path,
+        'planner': opts.planner,
+        'debug': opts.debug,
+    }
+    args.update(args_dict)
+
+    mbr = MBR(args.min_lat, args.min_lng, args.max_lat, args.max_lng)
+    args.grid_num = gps2grid(SPoint(args.max_lat, args.max_lng), mbr, args.grid_size)
+    args.grid_num = (args.grid_num[0] + 1, args.grid_num[1] + 1)
+
+    print(args)
+    logging.info(args_dict)
+
+    dam = DAPlanner(args.dam_root, args.id_size - 1, args.utc)
+    rid_features_dict = torch.from_numpy(rn.get_rid_rnfea_dict(dam, ts)).to(device)
+
+    traj_root = os.path.join("data", args.city)
+
+    if opts.test_flag:
+        test_dataset = GTrajRecTestData(rn, traj_root, mbr, args, 'test')
+        print('testing dataset shape: ' + str(len(test_dataset)))
+        logging.info('testing dataset shape: ' + str(len(test_dataset)))
+
+        test_iterator = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, collate_fn=lambda x: collate_fn_test(x), num_workers=opts.num_worker, pin_memory=True)
+
+        model = torch.load(os.path.join(model_save_path, 'val-best-model.pt'), map_location=device)
+        print('==> Model Loaded')
+
+        print("==> Starting Prediction...")
+        start_time = time.time()
+        data = infer(model, test_iterator, rid_features_dict, device)
+        end_time = time.time()
+        epoch_secs = end_time - start_time
+        print('Time: ' + str(epoch_secs) + 's')
+        logging.info('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / len(test_dataset) * 1000, len(test_dataset) / (end_time - start_time)))
+        print('Inference Time: {}, {}, {}'.format(end_time - start_time, (end_time - start_time) / len(test_dataset) * 1000, len(test_dataset) / (end_time - start_time)))
+        pickle.dump(data, open(os.path.join(model_save_path, 'infer_output_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
+
+        outputs = []
+        for pred_seg, pred_rate, trg_id, trg_rate, trg_gps, route in data:
+            pred_gps = toseq(rn, pred_seg, pred_rate, route, dam.seg_info)
+            outputs.append([pred_gps, pred_seg, trg_gps, trg_id])
+
+        test_trajs = pickle.load(open(os.path.join(traj_root, 'test_output.pkl'), "rb"))
+        groups = Counter(test_dataset.groups)
+        nums = []
+        for i in range(len(test_trajs)):
+            nums.append(groups[i])
+        results = []
+        for traj, num, src_mm in zip(test_trajs, nums, test_dataset.src_mms):
+            tmp_all = outputs[:num]
+            low_idx = traj.low_idx
+            gps, segs, _ = zip(*src_mm)
+            predict_ids = [segs[0]]
+            predict_gps = [gps[0]]
+            pointer = -1
+            for p1_idx, p2_idx, seg, latlng in zip(low_idx[:-1], low_idx[1:], segs[1:], gps[1:]):
+                if (p1_idx + 1) < p2_idx:
+                    pointer += 1
+                    tmp = tmp_all[pointer]
+                    predict_gps.extend(tmp[0])
+                    predict_ids.extend(tmp[1])
+                predict_ids.append(seg)
+                predict_gps.append(latlng)
+            outputs = outputs[num:]
+
+            mm_gps_seq = []
+            mm_eids = []
+            for i, pt in enumerate(traj.pt_list):
+                candi_pt = pt.data['candi_pt']
+                mm_eids.append(candi_pt.eid)
+                mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+            assert len(predict_gps) == len(mm_gps_seq) == len(predict_ids) == len(mm_eids)
+            results.append([predict_gps, predict_ids, mm_gps_seq, mm_eids])
+        pickle.dump(results, open(os.path.join(model_save_path, 'recovery_output_{}_{}.pkl'.format(opts.planner, opts.eid_cate)), "wb"))
+
+        print("==> Starting Evaluation...")
+        epoch_id1_loss = []
+        epoch_recall_loss = []
+        epoch_precision_loss = []
+        epoch_f1_loss = []
+        epoch_mae_loss = []
+        epoch_rmse_loss = []
+        for pred_gps, pred_seg, trg_gps, trg_id in results:
+            recall, precision, f1, loss_ids1, loss_mae, loss_rmse = calc_metrics(pred_seg, pred_gps, trg_id, trg_gps)
+            epoch_id1_loss.append(loss_ids1)
+            epoch_recall_loss.append(recall)
+            epoch_precision_loss.append(precision)
+            epoch_f1_loss.append(f1)
+            epoch_mae_loss.append(loss_mae)
+            epoch_rmse_loss.append(loss_rmse)
+
+        test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse = np.mean(epoch_recall_loss), np.mean(epoch_precision_loss), np.mean(epoch_f1_loss), np.mean(epoch_id1_loss), np.mean(epoch_mae_loss), np.mean(epoch_rmse_loss)
+        print(test_id_recall, test_id_precision, test_id_f1, test_id_acc, test_mae, test_rmse)
+
+        logging.info('Time: ' + str(epoch_secs) + 's')
+        logging.info('\tTest RID Acc:' + str(test_id_acc) +
+                     '\tTest RID Recall:' + str(test_id_recall) +
+                     '\tTest RID Precision:' + str(test_id_precision) +
+                     '\tTest RID F1 Score:' + str(test_id_f1) +
+                     '\tTest MAE Loss:' + str(test_mae) +
+                     '\tTest RMSE Loss:' + str(test_rmse))
+
+
+if __name__ == '__main__':
+    main()
+
