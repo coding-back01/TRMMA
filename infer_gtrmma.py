@@ -38,7 +38,6 @@ def main():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--lr', type=float, default=1e-3)
     parser.add_argument('--transformer_layers', type=int, default=2)
-    parser.add_argument('--gnn_layers', type=int, default=2, help='number of GNN layers')
     parser.add_argument('--heads', type=int, default=4)
     parser.add_argument("--gpu_id", type=str, default="0")
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')
@@ -107,7 +106,6 @@ def main():
     args_dict = {
         'device': device,
         'transformer_layers': opts.transformer_layers,
-        'gnn_layers': opts.gnn_layers,
         'heads': opts.heads,
         'tandem_fea_flag': True,
         'pro_features_flag': True,

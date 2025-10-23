@@ -1,261 +1,723 @@
 """
 G-TRMMA: Graph-Enhanced Trajectory Recovery with Map Matching Assistance
-核心创新：用GNN编码器替换原始TRMMA中的路线Transformer编码器，
-使模型能够理解路线的物理和几何结构（交叉口、转弯角度等）。
 """
 
 import random
 import time
-
 from tqdm import tqdm
 import os
 import datetime as dt
 import numpy as np
 import pickle
 import networkx as nx
-from queue import Queue
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset
+from torch_geometric.nn import GATConv
 
-from models.layers import Attention, GPSFormer, sequence_mask, sequence_mask3d
+from models.layers import Attention, sequence_mask, sequence_mask3d, GPSLayer, MultiHeadAttention, Norm, FeedForward
 from preprocess import SparseDAM, SegInfo
 from utils.model_utils import gps2grid, get_normalized_t
-from utils.spatial_func import SPoint, project_pt_to_road, rate2gps
-from utils.trajectory_func import STPoint
-from utils.candidate_point import CandidatePoint
-
-# 导入TRMMA中的辅助函数和类
-from models.trmma import (
-    get_num_pts, get_segs, remove_circle, calc_cos_value,
-    DAPlanner, TrajRecData, TrajRecTestData, DecoderMulti,
-    get_pro_features, get_label
-)
+from utils.spatial_func import SPoint, project_pt_to_road
 
 
-# ================== GNN Components ==================
+def remove_circle(path_fixed):
+    cur = 0
+    while cur < len(path_fixed):
+        eid = path_fixed[cur]
+        idx = []
+        for i in range(cur, len(path_fixed)):
+            if path_fixed[i] == eid:
+                idx.append(i)
+        path_fixed = path_fixed[0: cur] + path_fixed[max(idx): ]
+        cur += 1
+    return path_fixed
 
-class GATLayer(nn.Module):
-    """
-    Graph Attention Layer (GAT)
-    用于学习路网中每个路段的结构化表示，考虑邻居路段的影响
-    """
-    def __init__(self, in_dim, out_dim, num_heads=4, dropout=0.1, concat=True):
+
+def calc_cos_value(vec1, vec2):
+    vec1 = np.array(vec1, dtype=float)
+    vec2 = np.array(vec2, dtype=float)
+    a = vec1 * vec1
+    b = vec2 * vec2
+    c = vec1 * vec2
+    denom = np.sqrt(a[0] + a[1]) * np.sqrt(b[0] + b[1])
+    cos_value = (c[0] + c[1]) / denom if denom != 0 else 1.0
+    return cos_value
+
+
+def get_label(cpath, trg_rid):
+    label = []
+    pre_rid = -1
+    pre_prob = []
+    for rid in trg_rid:
+        if rid == pre_rid:
+            tmp = pre_prob
+        else:
+            idx = 0
+            if rid in cpath:
+                idx = cpath.index(rid)
+
+            tmp = [0] * len(cpath)
+            tmp[idx] = 1
+
+            pre_rid = rid
+            pre_prob = tmp
+        label.append(tmp)
+    return label
+
+
+def get_pro_features(ds_pt_list, hours):
+    hour = np.bincount(hours).argmax()
+    week = ds_pt_list[0].time_arr.weekday()
+    if week in [5, 6]:
+        hour += 24
+    return hour
+
+
+class DAPlanner(object):
+    
+    def __init__(self, dam_root, id_size, utc):
+        self.csm = SparseDAM(dam_root, id_size)
+        self.seg_info = SegInfo(os.path.join(dam_root, "seg_info.csv"))
+        self.G = pickle.load(open(os.path.join(dam_root, "road_graph_wtime"), "rb"))
+        print("Segment Nodes: {}, Edges: {}".format(len(self.G.nodes), len(self.G.edges)))
+        self.vehicle_num = np.load(os.path.join(dam_root, "vehicle_num_{}-48.npy".format(3600)))
+        self.tz = dt.timezone(dt.timedelta(hours=utc))
+
+        self.max_seq_len = 79
+        self.freq_limit = 1
+        self.dcsm_theta = 1
+
+        self.no_path_cnt = 0
+
+    def planning_multi_batch(self, ods, ts):
+        preds = []
+        for i, od in enumerate(ods):
+            route = self.planning_multi(od, ts[i])
+            preds.append(route)
+        return preds
+
+    def planning_multi(self, od, t, mode='da', segs_flag=False):
+        pred = [od[0]]
+        timestamp = t + self.seg_info.get_seg_travel_time(od[0])
+        segs = []
+        
+        for i in range(len(od)-1):
+            o = od[i]
+            d = od[i+1]
+
+            if pred[-1] != o:
+                break
+
+            if mode == 'da':
+                col_d = self.csm.get_col(d)
+                route = [o]
+                seg_used = np.zeros(self.seg_info.seg_num, dtype=np.int32)
+                seg_used[o] = 1
+                seg_used[d] = 1
+
+                while len(route) < self.max_seq_len and route[-1] != d:
+                    out_segs = list(self.G.neighbors(route[-1]))
+                    if len(out_segs) == 0:
+                        break
+
+                    nextseg = -1
+                    next_max = -1
+                    tie_cnt = 0
+                    tie_nbrs = []
+                    for seg in out_segs:
+                        if seg == d:
+                            nextseg = d
+                            tie_cnt = 1
+                            break
+
+                        if seg_used[seg] >= self.freq_limit:
+                            continue
+                        curr_prob = col_d[seg]
+                        if curr_prob is None:
+                            curr_prob = 0
+
+                        if curr_prob > next_max:
+                            nextseg = seg
+                            tie_cnt = 1
+                            next_max = curr_prob
+                            tie_nbrs = [seg]
+                        elif curr_prob == next_max:
+                            tie_cnt += 1
+                            tie_nbrs.append(seg)
+
+                    if tie_cnt != 1:
+                        if tie_cnt == 0:
+                            tie_nbrs = out_segs
+
+                        if next_max < self.dcsm_theta:
+                            nextseg, _ = self.break_tie_angle(route[-1], tie_nbrs, d)
+                        else:
+                            nextseg, flag = self.break_tie_traffic_flow(tie_nbrs, timestamp)
+                            if flag:
+                                nextseg, _ = self.break_tie_angle(route[-1], tie_nbrs, d)
+
+                    if nextseg == -1:
+                        break
+                    route.append(nextseg)
+                    timestamp += self.seg_info.get_seg_travel_time(nextseg)
+                    seg_used[nextseg] += 1
+
+                if route[-1] != d:
+                    try:
+                        _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="time")
+                    except nx.exception.NetworkXNoPath as e:
+                        self.no_path_cnt += 1
+                        route = [o, d]
+                route = remove_circle(route)
+                
+            elif mode == 'time':
+                try:
+                    _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="time")
+                except nx.exception.NetworkXNoPath as e:
+                    self.no_path_cnt += 1
+                    route = [o, d]
+                    
+            elif mode == 'length':
+                try:
+                    _, route = nx.bidirectional_dijkstra(self.G, o, d, weight="length")
+                except nx.exception.NetworkXNoPath as e:
+                    self.no_path_cnt += 1
+                    route = [o, d]
+            else:
+                raise NotImplementedError
+                
+            pred = pred + route[1:]
+            segs.append(route)
+            
+        if segs_flag:
+            return pred, segs
+        else:
+            return pred
+
+    def break_tie_angle(self, curr, tie_nbrs, d):
+        curr_geo = self.seg_info.get_seg_geo(curr)
+        curr_trg = curr_geo[2:]
+        d_geo = self.seg_info.get_seg_geo(d)
+        d_src = d_geo[:2]
+        vec1 = d_src - curr_trg
+
+        nextseg = -1
+        next_max = -2
+        tie_cnt = 0
+        for seg in tie_nbrs:
+            vec2 = self.seg_info.get_seg_vec(seg)
+            cos_value = calc_cos_value(vec1, vec2)
+            if cos_value > next_max:
+                nextseg = seg
+                tie_cnt = 1
+                next_max = cos_value
+            else:
+                tie_cnt += 1
+
+        flag = False
+        return nextseg, flag
+
+    def break_tie_traffic_flow(self, tie_nbrs, timestamp):
+        idx, _ = self.get_time_idx2(timestamp)
+        nextseg = -1
+        next_max = -1
+        tie_cnt = 0
+        for seg in tie_nbrs:
+            prob = self.vehicle_num[seg, idx]
+            if prob > next_max:
+                nextseg = seg
+                tie_cnt = 1
+                next_max = prob
+            elif prob == next_max:
+                tie_cnt += 1
+        flag = False
+        if tie_cnt > 1:
+            flag = True
+        return nextseg, flag
+
+    def get_time_idx2(self, timestamp):
+        time_arr = dt.datetime.fromtimestamp(timestamp, self.tz)
+        if time_arr.weekday() in [0, 1, 2, 3, 4]:
+            idx = time_arr.hour
+        else:
+            idx = time_arr.hour + 24
+        t_r = (time_arr.minute * 60 + time_arr.second) * 1.0 / 3600
+        return int(idx), t_r
+
+
+class TrajRecData(Dataset):
+    
+    def __init__(self, rn, trajs_dir, mbr, parameters, mode):
+        self.parameters = parameters
+        self.rn = rn
+        self.mbr = mbr
+        self.grid_size = parameters.grid_size
+        self.time_span = parameters.time_span
+        self.mode = mode
+        self.keep_ratio = parameters.keep_ratio
+
+        if mode == 'train':
+            file = os.path.join(trajs_dir, 'train.pkl')
+        elif mode == 'valid':
+            file = os.path.join(trajs_dir, 'valid.pkl')
+        else:
+            raise NotImplementedError
+            
+        trajs = pickle.load(open(file, "rb"))
+        if parameters.small and mode == 'train':
+            idx_group = 0
+            num_group = 5
+            num_k = len(trajs) // num_group
+            trajs = trajs[num_k * idx_group: num_k * (idx_group + 1)]
+        self.trajs = trajs
+
+    def __len__(self):
+        return len(self.trajs)
+
+    def __getitem__(self, index):
+        traj = self.trajs[index]
+
+        if self.mode == 'train':
+            length = len(traj.pt_list)
+            keep_index = [0] + sorted(random.sample(range(1, length - 1), int((length - 2) * self.keep_ratio))) + [length - 1]
+        else:
+            keep_index = traj.low_idx
+        src_list = np.array(traj.pt_list, dtype=object)
+        src_list = src_list[keep_index].tolist()
+
+        trg_list = traj.pt_list
+
+        data = []
+        for p1, p1_idx, p2, p2_idx in zip(src_list[:-1], keep_index[:-1], src_list[1:], keep_index[1:]):
+            if (p1_idx + 1) < p2_idx:
+                tmp_src_list = [p1, p2]
+
+                ls_grid_seq, ls_gps_seq, hours, tmp_seg_seq = self.get_src_seq(tmp_src_list)
+                features = get_pro_features(tmp_src_list, hours)
+
+                mm_eids, mm_rates = self.get_trg_seq(trg_list[p1_idx: p2_idx + 1])
+                path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
+
+                da_route = [self.rn.valid_edge_one[item] for item in path]
+                src_seg_seq = [self.rn.valid_edge_one[item] for item in tmp_seg_seq]
+                src_seg_feat = self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq)
+                label = get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1])
+
+                da_route = torch.tensor(da_route)
+                src_grid_seq = torch.tensor(ls_grid_seq)
+                src_pro_fea = torch.tensor(features)
+                src_seg_seq = torch.tensor(src_seg_seq)
+                src_seg_feat = torch.tensor(src_seg_feat)
+
+                trg_rid = torch.tensor(mm_eids)
+                trg_rate = torch.tensor(mm_rates)
+
+                label = torch.tensor(label, dtype=torch.float32)
+                d_rid = trg_rid[-1]
+                d_rate = trg_rate[-1]
+
+                data.append([da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_rid, trg_rate, label, d_rid, d_rate])
+
+        return data
+
+    def get_src_seg_feat(self, gps_seq, seg_seq):
+        feats = []
+        for ds_pt, seg in zip(gps_seq, seg_seq):
+            gps = SPoint(ds_pt[0], ds_pt[1])
+            candi = self.rn.pt2seg(gps, seg)
+            feats.append([candi.rate])
+        return feats
+
+    def get_src_seq(self, ds_pt_list):
+        hours = []
+        ls_grid_seq = []
+        ls_gps_seq = []
+        first_pt = ds_pt_list[0]
+        time_interval = self.time_span
+        seg_seq = []
+        
+        for ds_pt in ds_pt_list:
+            hours.append(ds_pt.time_arr.hour)
+            t = get_normalized_t(first_pt, ds_pt, time_interval)
+            ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
+            if self.parameters.gps_flag:
+                locgrid_xid = (ds_pt.lat - self.rn.minLat) / (self.rn.maxLat - self.rn.minLat)
+                locgrid_yid = (ds_pt.lng - self.rn.minLon) / (self.rn.maxLon - self.rn.minLon)
+            else:
+                locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
+            ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
+            seg_seq.append(ds_pt.data['candi_pt'].eid)
+
+        return ls_grid_seq, ls_gps_seq, hours, seg_seq
+
+    def get_trg_seq(self, tmp_pt_list):
+        mm_eids = []
+        mm_rates = []
+        for pt in tmp_pt_list:
+            candi_pt = pt.data['candi_pt']
+            mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
+            mm_rates.append([candi_pt.rate])
+        return mm_eids, mm_rates
+
+
+class TrajRecTestData(Dataset):
+    
+    def __init__(self, rn, trajs_dir, mbr, parameters, mode):
+        self.parameters = parameters
+        self.rn = rn
+        self.mbr = mbr
+        self.grid_size = parameters.grid_size
+        self.time_span = parameters.time_span
+
+        self.dam = DAPlanner(parameters.dam_root, parameters.id_size - 1, parameters.utc)
+        
+        if parameters.eid_cate == 'gps2seg':
+            inferred_segs = pickle.load(open(parameters.inferred_seg_path, "rb"))
+            predict_id, _ = zip(*inferred_segs)
+        elif parameters.eid_cate in ['mm', 'nn']:
+            predict_id = pickle.load(open(os.path.join(trajs_dir, "test_{}_eids.pkl".format(parameters.eid_cate)), "rb"))
+        else:
+            predict_id = []
+
+        self.src_grid_seqs, self.src_gps_seqs, self.src_pro_feas = [], [], []
+        self.trg_gps_seqs, self.trg_rids, self.trg_rates = [], [], []
+        self.src_seg_seq = []
+        self.src_seg_feats = []
+        self.src_time_seq = []
+        self.trg_time_seq = []
+        self.routes = []
+        self.labels = []
+        trajs = pickle.load(open(os.path.join(trajs_dir, 'test_output.pkl'), "rb"))
+
+        self.groups = []
+        self.src_mms = []
+        route_time = 0
+        
+        for serial, traj in tqdm(enumerate(trajs), desc='traj num'):
+            trg_list = traj.pt_list.copy()
+            src_list = np.array(traj.pt_list, dtype=object)
+            src_list = src_list[traj.low_idx].tolist()
+
+            _, src_gps_seq, _, seg_seq, time_seq = self.get_src_seq(src_list)
+            if parameters.eid_cate in ['mm', 'nn', 'gps2seg']:
+                seg_seq = predict_id[serial]
+            src_mm = []
+            for seg, (lat, lng) in zip(seg_seq, src_gps_seq):
+                projected, rate, dist = project_pt_to_road(self.rn, SPoint(lat, lng), seg)
+                src_mm.append([[projected.lat, projected.lng], seg, rate])
+            self.src_mms.append(src_mm)
+
+            for p1, p1_idx, p2, p2_idx, s1, s2, ts, mmf1, mmf2 in zip(
+                src_list[:-1], traj.low_idx[:-1], src_list[1:], traj.low_idx[1:], 
+                seg_seq[:-1], seg_seq[1:], time_seq[:-1], src_mm[:-1], src_mm[1:]
+            ):
+                if (p1_idx + 1) < p2_idx:
+                    tmp_seg_seq = [s1, s2]
+                    tmp_src_list = [p1, p2]
+
+                    ls_grid_seq, ls_gps_seq, hours, _, _ = self.get_src_seq(tmp_src_list)
+                    features = get_pro_features(tmp_src_list, hours)
+
+                    mm_gps_seq, mm_eids, mm_rates, trg_time = self.get_trg_seq(trg_list[p1_idx: p2_idx + 1])
+                    path = traj.cpath[p1.cpath_idx: p2.cpath_idx + 1]
+
+                    if parameters.eid_cate in ['mm', 'nn', 'gps2seg']:
+                        t0 = time.time()
+                        path = self.dam.planning_multi([s1, s2], ts, mode=parameters.planner)
+                        route_time += time.time() - t0
+                        mm_gps_seq[0] = mmf1[0]
+                        mm_eids[0] = self.rn.valid_edge_one[mmf1[1]]
+                        mm_rates[0] = [mmf1[2]]
+                        mm_gps_seq[-1] = mmf2[0]
+                        mm_eids[-1] = self.rn.valid_edge_one[mmf2[1]]
+                        mm_rates[-1] = [mmf2[2]]
+
+                    self.routes.append([self.rn.valid_edge_one[item] for item in path])
+                    self.src_seg_seq.append([self.rn.valid_edge_one[item] for item in tmp_seg_seq])
+                    self.src_seg_feats.append(self.get_src_seg_feat(ls_gps_seq, tmp_seg_seq))
+                    self.labels.append(get_label([self.rn.valid_edge_one[item] for item in path], mm_eids[1:-1]))
+
+                    self.trg_gps_seqs.append(mm_gps_seq)
+                    self.trg_rids.append(mm_eids)
+                    self.trg_rates.append(mm_rates)
+                    self.src_grid_seqs.append(ls_grid_seq)
+                    self.src_gps_seqs.append(ls_gps_seq)
+                    self.src_pro_feas.append(features)
+                    self.src_time_seq.append(time_seq)
+                    self.trg_time_seq.append(trg_time)
+                    self.groups.append(serial)
+        print(route_time, route_time / len(trajs) * 1000, len(trajs) / route_time)
+
+    def __len__(self):
+        return len(self.src_grid_seqs)
+
+    def __getitem__(self, index):
+        src_grid_seq = self.src_grid_seqs[index]
+        trg_gps_seq = self.trg_gps_seqs[index]
+        trg_rid = self.trg_rids[index]
+        trg_rate = self.trg_rates[index]
+        da_route = self.routes[index]
+
+        label = self.labels[index]
+        label = torch.tensor(label, dtype=torch.float32)
+
+        src_seg_seq = self.src_seg_seq[index]
+        src_seg_feat = self.src_seg_feats[index]
+        src_seg_seq = torch.tensor(src_seg_seq)
+        src_seg_feat = torch.tensor(src_seg_feat)
+
+        src_grid_seq = torch.tensor(src_grid_seq)
+        trg_gps_seq = torch.tensor(trg_gps_seq)
+        trg_rid = torch.tensor(trg_rid)
+        trg_rate = torch.tensor(trg_rate)
+        src_pro_fea = torch.tensor(self.src_pro_feas[index])
+        da_route = torch.tensor(da_route)
+
+        d_rid = trg_rid[-1]
+        d_rate = trg_rate[-1]
+        trg_gps_seq = trg_gps_seq
+        trg_rid = trg_rid
+        trg_rate = trg_rate
+
+        return da_route, src_grid_seq, src_pro_fea, src_seg_seq, src_seg_feat, trg_gps_seq, trg_rid, trg_rate, label, d_rid, d_rate
+
+    def get_src_seg_feat(self, gps_seq, seg_seq):
+        feats = []
+        for ds_pt, seg in zip(gps_seq, seg_seq):
+            gps = SPoint(ds_pt[0], ds_pt[1])
+            candi = self.rn.pt2seg(gps, seg)
+            feats.append([candi.rate])
+        return feats
+
+    def get_src_seq(self, ds_pt_list):
+        timestamps = []
+        hours = []
+        ls_grid_seq = []
+        ls_gps_seq = []
+        first_pt = ds_pt_list[0]
+        time_interval = self.time_span
+        seg_seq = []
+        
+        for ds_pt in ds_pt_list:
+            timestamps.append(ds_pt.time)
+            hours.append(ds_pt.time_arr.hour)
+            t = get_normalized_t(first_pt, ds_pt, time_interval)
+            ls_gps_seq.append([ds_pt.lat, ds_pt.lng])
+            if self.parameters.gps_flag:
+                locgrid_xid = (ds_pt.lat - self.rn.minLat) / (self.rn.maxLat - self.rn.minLat)
+                locgrid_yid = (ds_pt.lng - self.rn.minLon) / (self.rn.maxLon - self.rn.minLon)
+            else:
+                locgrid_xid, locgrid_yid = gps2grid(ds_pt, self.mbr, self.grid_size)
+            ls_grid_seq.append([locgrid_xid, locgrid_yid, t])
+            seg_seq.append(ds_pt.data['candi_pt'].eid)
+
+        return ls_grid_seq, ls_gps_seq, hours, seg_seq, timestamps
+
+    def get_trg_seq(self, tmp_pt_list):
+        mm_gps_seq = []
+        mm_eids = []
+        mm_rates = []
+        time_arrs = []
+        for pt in tmp_pt_list:
+            time_arr = pt.time_arr
+            time_arrs.append([time_arr.month + 1, time_arr.day + 1, 1 if time_arr.weekday() in [0, 1, 2, 3, 4] else 2, time_arr.hour + 1, time_arr.minute + 1, time_arr.second + 1])
+            candi_pt = pt.data['candi_pt']
+
+            mm_gps_seq.append([candi_pt.lat, candi_pt.lng])
+            mm_eids.append(self.rn.valid_edge_one[candi_pt.eid])
+            mm_rates.append([candi_pt.rate])
+        return mm_gps_seq, mm_eids, mm_rates, time_arrs
+
+
+class DecoderMulti(nn.Module):
+    
+    def __init__(self, parameters):
         super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.num_heads = num_heads
-        self.concat = concat
+
+        self.id_size = parameters.id_size
+        self.emb_id = None
+        self.dest_type = parameters.dest_type
+        self.rate_flag = parameters.rate_flag
+        self.prog_flag = parameters.prog_flag
+        self.rid_feats_flag = parameters.rid_feats_flag
+
+        rnn_input_dim = parameters.hid_dim
+        if self.rid_feats_flag:
+            rnn_input_dim += parameters.rid_fea_dim
+        if self.rate_flag:
+            rnn_input_dim += 1
+        if self.dest_type in [1, 2]:
+            rnn_input_dim += parameters.hid_dim
+            if self.rid_feats_flag:
+                rnn_input_dim += parameters.rid_fea_dim
+            if self.rate_flag:
+                rnn_input_dim += 1
+
+        self.rnn = nn.GRU(rnn_input_dim, parameters.hid_dim)
+        self.attn_route = Attention(parameters.hid_dim)
+
+        if self.rate_flag:
+            fc_rate_out_input_dim = parameters.hid_dim + parameters.hid_dim
+            self.fc_rate_out = nn.Sequential(
+                nn.Linear(fc_rate_out_input_dim, parameters.hid_dim * 2),
+                nn.ReLU(),
+                nn.Linear(parameters.hid_dim * 2, 1),
+                nn.Sigmoid()
+            )
+
+    def decoding_step(self, input_id, input_rate, hidden, route_outputs,
+                      route_attn_mask, d_rids, d_rates, rid_features_dict, dt, observed_emb, observed_mask):
+
+        rnn_input = self.emb_id[input_id]
+        if self.rid_feats_flag:
+            rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)
+        if self.rate_flag:
+            rnn_input = torch.cat((rnn_input, input_rate), dim=-1)
+        if self.dest_type in [1, 2]:
+            embed_drids = self.emb_id[d_rids]
+            rnn_input = torch.cat((rnn_input, embed_drids), dim=-1)
+            if self.rid_feats_flag:
+                rnn_input = torch.cat([rnn_input, rid_features_dict[input_id]], dim=-1)
+            if self.rate_flag:
+                rnn_input = torch.cat((rnn_input, d_rates), dim=-1)
+        rnn_input = rnn_input.unsqueeze(0)
+
+        output, hidden = self.rnn(rnn_input, hidden)
+
+        query = hidden.permute(1, 0, 2)
         
-        if concat:
-            assert out_dim % num_heads == 0
-            self.head_dim = out_dim // num_heads
+        key = route_outputs.permute(1, 0, 2).unsqueeze(1)
+        scores, weighted = self.attn_route(query, key, key, route_attn_mask.unsqueeze(1))
+        prediction_id = scores.squeeze(1).masked_fill(route_attn_mask == 0, 0)
+        weighted = weighted.permute(1, 0, 2)
+
+        if self.rate_flag:
+            rate_input = torch.cat((hidden, weighted), dim=-1).squeeze(0)
+            prediction_rate = self.fc_rate_out(rate_input)
         else:
-            self.head_dim = out_dim
+            prediction_rate = torch.ones((prediction_id.shape[0], 1), dtype=torch.float32, device=hidden.device) / 2
+
+        return prediction_id, prediction_rate, hidden
+
+    def forward(self, max_trg_len, batch_size, trg_id, trg_rate, trg_len, hidden, rid_features_dict, 
+                routes, route_outputs, route_attn_mask, d_rids, d_rates, teacher_forcing_ratio):
+
+        routes = routes.permute(1, 0)
+        outputs_id = torch.zeros([max_trg_len, batch_size, routes.shape[1]], device=hidden.device)
+        rate_out_dim = 1
+        outputs_rate = torch.zeros([max_trg_len, batch_size, rate_out_dim], device=hidden.device)
+
+        input_id = trg_id[0, :]
+        input_rate = trg_rate[0, :]
         
-        # 多头注意力的线性变换
-        self.W = nn.Linear(in_dim, self.head_dim * num_heads, bias=False)
-        # 注意力计算参数 - 为每个head单独定义
-        self.a = nn.Parameter(torch.randn(num_heads, 2 * self.head_dim))
+        for t in range(1, max_trg_len):
+            teacher_force = random.random() < teacher_forcing_ratio
+
+            dt = None
+            observed_emb = None
+            observed_mask = None
+
+            prediction_id, prediction_rate, hidden = self.decoding_step(
+                input_id, input_rate, hidden, route_outputs, route_attn_mask, 
+                d_rids, d_rates, rid_features_dict, dt, observed_emb, observed_mask
+            )
+
+            if teacher_forcing_ratio == -1 and self.prog_flag:
+                for i in range(batch_size):
+                    if t < trg_len[i]:
+                        prev_idx = (input_id[i] == routes[i]).nonzero(as_tuple=True)[0][0]
+                        tmp_flag = True
+                        while tmp_flag:
+                            cur_idx = prediction_id[i].argmax()
+                            if cur_idx < prev_idx:
+                                prediction_id[i, cur_idx] = 1e-6
+                            else:
+                                tmp_flag = False
+
+            outputs_id[t] = prediction_id
+            outputs_rate[t] = prediction_rate
+
+            if teacher_force:
+                input_id = trg_id[t]
+                input_rate = trg_rate[t]
+            else:
+                input_id = (F.one_hot(prediction_id.argmax(dim=1), routes.shape[1]) * routes).sum(-1)
+                input_rate = prediction_rate
+
+        mask_trg = torch.ones([batch_size, max_trg_len], device=outputs_id.device)
+        mask_trg = sequence_mask(mask_trg, torch.tensor(trg_len, device=outputs_id.device))
+        outputs_rate = outputs_rate.permute(1, 0, 2)
+        outputs_rate = outputs_rate.masked_fill(mask_trg.unsqueeze(-1) == 0, 0)
+        outputs_rate = outputs_rate.permute(1, 0, 2)
         
-        self.leaky_relu = nn.LeakyReLU(0.2)
-        self.dropout = nn.Dropout(dropout)
-        
-        if not concat:
-            self.out_proj = nn.Linear(out_dim * num_heads, out_dim)
-    
-    def forward(self, node_features, edge_index):
-        """
-        Args:
-            node_features: [num_nodes, in_dim] 节点特征
-            edge_index: [2, num_edges] 边索引 (source, target)
-        Returns:
-            [num_nodes, out_dim] 更新后的节点特征
-        """
-        num_nodes = node_features.size(0)
-        num_edges = edge_index.size(1)
-        
-        # 线性变换: [num_nodes, head_dim * num_heads]
-        h = self.W(node_features)
-        # 重塑为多头: [num_nodes, num_heads, head_dim]
-        h = h.view(num_nodes, self.num_heads, self.head_dim)
-        
-        # 准备注意力计算
-        src, dst = edge_index[0], edge_index[1]
-        
-        # 获取源节点和目标节点的特征
-        h_src = h[src]  # [num_edges, num_heads, head_dim]
-        h_dst = h[dst]  # [num_edges, num_heads, head_dim]
-        
-        # 拼接并计算注意力分数
-        h_cat = torch.cat([h_src, h_dst], dim=-1)  # [num_edges, num_heads, 2*head_dim]
-        
-        # 计算注意力分数 - 使用einsum进行高效计算
-        # h_cat: [num_edges, num_heads, 2*head_dim]
-        # self.a: [num_heads, 2*head_dim]
-        # 结果: [num_edges, num_heads]
-        attn_scores = torch.einsum('ehd,hd->eh', h_cat, self.a)
-        attn_scores = self.leaky_relu(attn_scores)  # [num_edges, num_heads]
-        
-        # 对每个目标节点的所有入边进行softmax
-        attn_weights = self._scatter_softmax(attn_scores, dst, num_nodes)
-        attn_weights = self.dropout(attn_weights)
-        
-        # 聚合邻居特征
-        # [num_edges, num_heads, head_dim] * [num_edges, num_heads, 1]
-        weighted_h = h_src * attn_weights.unsqueeze(-1)
-        
-        # 对每个节点聚合其所有入边的加权特征
-        # 【优化】添加自环到聚合中，防止孤立节点信息丢失
-        out = torch.zeros(num_nodes, self.num_heads, self.head_dim, 
-                         device=node_features.device, dtype=node_features.dtype)
-        
-        # 扩展dst以匹配多头和特征维度: [num_edges] -> [num_edges, num_heads, head_dim]
-        dst_expanded = dst.view(-1, 1, 1).expand(-1, self.num_heads, self.head_dim)
-        
-        # 使用scatter_add在第0维聚合
-        out.scatter_add_(0, dst_expanded, weighted_h)
-        
-        if self.concat:
-            # 拼接多头输出: [num_nodes, num_heads * head_dim]
-            out = out.view(num_nodes, -1)
-        else:
-            # 平均多头输出: [num_nodes, head_dim]
-            out = out.mean(dim=1)
-            out = self.out_proj(out)
-        
-        return out
-    
-    def _scatter_softmax(self, scores, indices, num_nodes):
-        """
-        对每个节点的入边分数进行softmax归一化
-        使用稳定的scatter方法（不使用beta API）
-        Args:
-            scores: [num_edges, num_heads] 注意力分数
-            indices: [num_edges] 目标节点索引
-            num_nodes: 总节点数
-        Returns:
-            [num_edges, num_heads] 归一化后的注意力权重
-        """
-        num_edges = scores.size(0)
-        num_heads = scores.size(1)
-        
-        # 使用更简单的方法：直接计算softmax，不做数值稳定化
-        # 对于图神经网络，边的数量通常不会太大，直接计算是安全的
-        exp_scores = torch.exp(scores)  # [num_edges, num_heads]
-        
-        # 对每个节点计算exp的和
-        sum_exp = torch.zeros(num_nodes, num_heads, device=scores.device, dtype=scores.dtype)
-        
-        # 使用scatter_add聚合
-        indices_expanded = indices.unsqueeze(1).expand(-1, num_heads)  # [num_edges, num_heads]
-        sum_exp.scatter_add_(0, indices_expanded, exp_scores)
-        
-        # 归一化
-        weights = exp_scores / (sum_exp[indices] + 1e-16)
-        
-        return weights
+        return outputs_id, outputs_rate
 
 
 class RouteGraphEncoder(nn.Module):
-    """
-    路线图编码器：使用GNN处理路线子图
-    核心创新：将路线R视为一个子图，学习其拓扑和几何结构
-    """
-    def __init__(self, hid_dim, num_layers=2, num_heads=4, dropout=0.1):
+    def __init__(self, hid_dim, num_layers=1, num_heads=4, dropout=0.1):
         super().__init__()
         self.hid_dim = hid_dim
         self.num_layers = num_layers
         
-        # 多层GAT
-        self.gat_layers = nn.ModuleList()
-        for i in range(num_layers):
-            if i == 0:
-                # 第一层：输入维度为hid_dim
-                self.gat_layers.append(GATLayer(hid_dim, hid_dim, num_heads, dropout, concat=True))
-            else:
-                # 后续层
-                self.gat_layers.append(GATLayer(hid_dim, hid_dim, num_heads, dropout, concat=True))
-        
-        # Layer normalization
-        self.norms = nn.ModuleList([nn.LayerNorm(hid_dim) for _ in range(num_layers)])
-        
-        # 【修复】所有层都使用Identity残差连接（输入输出维度相同）
-        self.residual_proj = nn.ModuleList([
-            nn.Identity() for _ in range(num_layers)
+        self.gat_layers = nn.ModuleList([
+            GATConv(hid_dim, hid_dim // num_heads, heads=num_heads, dropout=dropout, concat=True, add_self_loops=False)
+            for _ in range(num_layers)
         ])
+        self.norms = nn.ModuleList([nn.LayerNorm(hid_dim) for _ in range(num_layers)])
     
     def forward(self, route_emb, route_len, adj_matrices):
-        """
-        Args:
-            route_emb: [max_route_len, batch_size, hid_dim] 路线嵌入
-            route_len: [batch_size] 每条路线的实际长度
-            adj_matrices: List of [2, num_edges] 每个样本的邻接矩阵（边索引）
-        Returns:
-            route_outputs: [max_route_len, batch_size, hid_dim] GNN编码后的路线表示
-        """
-        max_route_len, batch_size, _ = route_emb.shape
+        batch_size, max_route_len, _ = route_emb.shape
         
-        # 转换维度: [batch_size, max_route_len, hid_dim]
-        route_emb = route_emb.transpose(0, 1)
+        node_list = []
+        edge_list = []
+        offset = 0
         
-        # 对批次中的每个样本分别处理
-        outputs = []
         for i in range(batch_size):
-            # 获取该样本的有效路线长度和邻接矩阵
             valid_len = route_len[i].item()
-            node_features = route_emb[i, :valid_len, :]  # [valid_len, hid_dim]
-            edge_index = adj_matrices[i]  # [2, num_edges]
+            node_list.append(route_emb[i, :valid_len, :])
+            edge_list.append(adj_matrices[i] + offset)
+            offset += valid_len
+        
+        batched_nodes = torch.cat(node_list, dim=0)
+        batched_edges = torch.cat(edge_list, dim=1)
+        
+        h = batched_nodes
+        for gat, norm in zip(self.gat_layers, self.norms):
+            h_new = gat(h, batched_edges)
+            h = norm(h + h_new)
+        
+        outputs = []
+        node_idx = 0
+        for i in range(batch_size):
+            valid_len = route_len[i].item()
+            sample_h = h[node_idx:node_idx + valid_len]
             
-            # 通过多层GAT
-            h = node_features
-            for layer_idx, (gat, norm, res_proj) in enumerate(zip(self.gat_layers, self.norms, self.residual_proj)):
-                h_new = gat(h, edge_index)
-                # Post-LN：先加残差，再归一化（更标准）
-                h = norm(h + h_new)
-                h = F.relu(h)
-            
-            # Padding到最大长度
             if valid_len < max_route_len:
                 padding = torch.zeros(max_route_len - valid_len, self.hid_dim, 
                                     device=route_emb.device, dtype=route_emb.dtype)
-                h = torch.cat([h, padding], dim=0)
-            
-            outputs.append(h)
+                sample_h = torch.cat([sample_h, padding], dim=0)
+            outputs.append(sample_h)
+            node_idx += valid_len
         
-        # 堆叠: [batch_size, max_route_len, hid_dim]
         route_outputs = torch.stack(outputs, dim=0)
-        
-        # 转换回: [max_route_len, batch_size, hid_dim]
-        route_outputs = route_outputs.transpose(0, 1)
-        
         return route_outputs
 
 
 class GNNRouteEncoder(nn.Module):
-    """
-    GNN路线编码器：完全模仿TRMMA的DualFormer结构
-    核心改进：用GNN替换Route的自注意力，但保留GPS-Route交互
-    """
     def __init__(self, parameters):
         super().__init__()
         self.hid_dim = parameters.hid_dim
         self.pro_features_flag = parameters.pro_features_flag
+        self.num_layers = parameters.transformer_layers
         
-        # 【关键修复】强制GPS和Route层数相同，确保每层都交互
-        # 这是DualFormer的核心设计理念
-        self.num_layers = parameters.transformer_layers  # 使用transformer_layers作为统一层数
-        
-        # GPS轨迹编码器（保持不变）
-        from models.layers import GPSLayer, MultiHeadAttention, Norm, FeedForward
         self.gps_layers = nn.ModuleList([
             GPSLayer(parameters.hid_dim, parameters.heads) 
             for _ in range(self.num_layers)
         ])
         
-        # 路线GNN层 + GPS交互层（模仿RouteLayer结构）
         self.route_gnn_layers = nn.ModuleList([
             RouteGraphEncoder(parameters.hid_dim, num_layers=1, num_heads=parameters.heads)
             for _ in range(self.num_layers)
@@ -272,59 +734,44 @@ class GNNRouteEncoder(nn.Module):
                                         for _ in range(self.num_layers)])
         self.dropout = nn.Dropout(0.1)
         
-        # 时间特征嵌入
         if self.pro_features_flag:
             self.temporal = nn.Embedding(parameters.pro_input_dim, parameters.pro_output_dim)
             self.fc_hid = nn.Linear(parameters.hid_dim + parameters.pro_output_dim, parameters.hid_dim)
     
     def forward(self, src, src_len, route, route_len, adj_matrices, pro_features):
-        """
-        完全模仿GRFormer的结构，但Route自注意力用GNN替代
-        """
         bs = src.size(1)
         src_max_len = src.size(0)
         route_max_len = route.size(0)
         
-        # 创建掩码
         gps_mask3d = torch.ones(bs, src_max_len, src_max_len, device=src.device)
         gps_mask3d = sequence_mask3d(gps_mask3d, src_len, src_len)
         inter_mask = torch.ones(bs, route_max_len, src_max_len, device=src.device)
         inter_mask = sequence_mask3d(inter_mask, route_len, src_len)
         
-        # 转换维度
-        gps_emb = src.transpose(0, 1)  # [bs, src_len, hid_dim]
-        route_emb = route.transpose(0, 1)  # [bs, route_len, hid_dim]
+        gps_emb = src.transpose(0, 1)
+        route_emb = route.transpose(0, 1)
         
-        # 【关键修复】逐层同步处理GPS和Route（完全模仿GRFormer）
         for layer_idx in range(self.num_layers):
-            # 1. GPS层（学习驾驶行为）
             gps_emb = self.gps_layers[layer_idx](gps_emb, gps_mask3d)
             
-            # 2. Route GNN层（学习路网结构）
-            route_t = route_emb.transpose(0, 1)  # [route_len, bs, hid_dim]
-            route_gnn_out = self.route_gnn_layers[layer_idx](route_t, route_len, adj_matrices)
-            route_gnn_out = route_gnn_out.transpose(0, 1)  # [bs, route_len, hid_dim]
+            route_gnn_out = self.route_gnn_layers[layer_idx](route_emb, route_len, adj_matrices)
             route1 = self.dropout(route_gnn_out)
             route_out = self.route_norms1[layer_idx](route_emb + route1)
             
-            # 3. Route关注GPS（融合驾驶行为和路网结构）
             route2 = self.dropout(self.route_gps_attns[layer_idx](route_out, gps_emb, gps_emb, inter_mask))
             route_out2 = self.route_norms2[layer_idx](route_out + route2)
             
-            # 4. FeedForward
             route_emb = self.route_ffs[layer_idx](route_out2)
         
-        route_outputs = route_emb.transpose(0, 1)  # [route_len, bs, hid_dim]
+        route_outputs = route_emb.transpose(0, 1)
         
-        # 计算隐藏状态
         route_mask2d = torch.ones(bs, route_max_len, device=route.device)
         route_mask2d = sequence_mask(route_mask2d, route_len).transpose(0, 1).unsqueeze(-1).repeat(1, 1, self.hid_dim)
         
         masked_route = route_outputs * route_mask2d
         hidden = torch.sum(masked_route, dim=0) / route_len.unsqueeze(-1).repeat(1, self.hid_dim)
-        hidden = hidden.unsqueeze(0)  # [1, bs, hid_dim]
+        hidden = hidden.unsqueeze(0)
         
-        # 融合时间特征
         if self.pro_features_flag:
             extra_emb = self.temporal(pro_features)
             extra_emb = extra_emb.unsqueeze(0)
@@ -333,13 +780,7 @@ class GNNRouteEncoder(nn.Module):
         return route_outputs, hidden
 
 
-# ================== G-TRMMA Model ==================
-
 class GTrajRecovery(nn.Module):
-    """
-    G-TRMMA主模型：使用GNN增强的轨迹恢复模型
-    核心创新：用GNN处理路线子图，理解路网的物理和几何结构
-    """
     def __init__(self, parameters):
         super().__init__()
         self.srcseg_flag = parameters.srcseg_flag
@@ -348,16 +789,13 @@ class GTrajRecovery(nn.Module):
         self.rid_feats_flag = parameters.rid_feats_flag
         self.params = parameters
         
-        # 路段ID嵌入
         self.emb_id = nn.Parameter(torch.rand(parameters.id_size, parameters.id_emb_dim))
         
-        # 位置编码
         if self.learn_pos:
             max_input_length = 500
             self.pos_embedding_gps = nn.Embedding(max_input_length, parameters.hid_dim)
             self.pos_embedding_route = nn.Embedding(max_input_length, parameters.hid_dim)
         
-        # GPS输入处理
         input_dim_gps = 3
         if self.learn_pos:
             input_dim_gps += parameters.hid_dim
@@ -365,7 +803,6 @@ class GTrajRecovery(nn.Module):
             input_dim_gps += parameters.hid_dim + 1
         self.fc_in_gps = nn.Linear(input_dim_gps, parameters.hid_dim)
         
-        # 路线输入处理
         input_dim_route = parameters.hid_dim
         if self.learn_pos:
             input_dim_route += parameters.hid_dim
@@ -373,16 +810,12 @@ class GTrajRecovery(nn.Module):
             input_dim_route += parameters.rid_fea_dim
         self.fc_in_route = nn.Linear(input_dim_route, parameters.hid_dim)
         
-        # 编码器：使用GNN处理路线
         self.encoder = GNNRouteEncoder(parameters)
-        
-        # 解码器：复用TRMMA的解码器
         self.decoder = DecoderMulti(parameters)
         
         self.init_weights()
     
     def init_weights(self):
-        """权重初始化"""
         ih = (param.data for name, param in self.named_parameters() if 'weight_ih' in name)
         hh = (param.data for name, param in self.named_parameters() if 'weight_hh' in name)
         b = (param.data for name, param in self.named_parameters() if 'bias' in name)
@@ -398,18 +831,11 @@ class GTrajRecovery(nn.Module):
                 rid_features_dict, da_routes, da_lengths, da_pos, 
                 src_seg_seqs, src_seg_feats, adj_matrices, d_rids, d_rates, 
                 teacher_forcing_ratio):
-        """
-        前向传播
-        Args:
-            adj_matrices: List of edge_index，每个样本的路线子图邻接矩阵
-        """
         max_trg_len = trg_id.size(0)
         batch_size = trg_id.size(1)
         
-        # 路段嵌入传递给解码器
         self.decoder.emb_id = self.emb_id
         
-        # 1. GPS输入处理
         gps_emb = src.float()
         if self.learn_pos:
             gps_pos = src[:, :, -1].long()
@@ -421,7 +847,6 @@ class GTrajRecovery(nn.Module):
         gps_in = self.fc_in_gps(gps_emb)
         gps_in_lens = torch.tensor(src_len, device=src.device)
         
-        # 2. 路线输入处理
         route_emb = self.emb_id[da_routes]
         if self.learn_pos:
             route_pos_emb = self.pos_embedding_route(da_pos)
@@ -432,15 +857,12 @@ class GTrajRecovery(nn.Module):
         route_in = self.fc_in_route(route_emb)
         route_in_lens = torch.tensor(da_lengths, device=src.device)
         
-        # 3. 编码：使用GNN处理路线
         route_outputs, hiddens = self.encoder(gps_in, gps_in_lens, route_in, 
                                               route_in_lens, adj_matrices, pro_features)
         
-        # 4. 准备解码器的注意力掩码
         route_attn_mask = torch.ones(batch_size, max(da_lengths), device=src.device)
         route_attn_mask = sequence_mask(route_attn_mask, route_in_lens)
         
-        # 5. 解码
         outputs_id, outputs_rate = self.decoder(
             max_trg_len, batch_size, trg_id, trg_rate, trg_len, hiddens,
             rid_features_dict, da_routes, route_outputs, route_attn_mask,
@@ -453,133 +875,87 @@ class GTrajRecovery(nn.Module):
         return final_outputs_id, final_outputs_rate
 
 
-# ================== Dataset with Graph Construction ==================
-
 class GTrajRecData(TrajRecData):
-    """
-    G-TRMMA的训练数据集
-    扩展原始数据集，增加路线子图的构建
-    """
     def __init__(self, rn, trajs_dir, mbr, parameters, mode):
         super().__init__(rn, trajs_dir, mbr, parameters, mode)
-        # 保存路网图，用于构建路线子图
         self.G = pickle.load(open(os.path.join(parameters.dam_root, "road_graph_wtime"), "rb"))
+        self.route_cache = {}
     
     def __getitem__(self, index):
-        # 调用父类方法获取基础数据
         data_list = super().__getitem__(index)
         
-        # 为每个数据项添加邻接矩阵
         enhanced_data = []
         for data_item in data_list:
-            da_route = data_item[0]  # [route_len]
+            da_route = data_item[0]
+            route_key = tuple(da_route.tolist())
             
-            # 构建路线子图的邻接矩阵
-            edge_index = self._build_route_graph(da_route)
+            if route_key not in self.route_cache:
+                edge_index = self._build_route_graph_with_topology(route_key)
+                self.route_cache[route_key] = edge_index
+            else:
+                edge_index = self.route_cache[route_key]
             
-            # 添加邻接矩阵到数据项
             enhanced_data.append(data_item + [edge_index])
         
         return enhanced_data
     
-    def _build_route_graph(self, route_tensor):
-        """
-        根据路线构建子图的边索引
-        【优化版】更稳定的图结构：主要依赖顺序性，减少复杂连接
+    def _build_route_graph_with_topology(self, route_tuple):
+        route_len = len(route_tuple)
+        edges = set()
         
-        Args:
-            route_tensor: [route_len] 路线路段ID序列（tensor）
-        Returns:
-            edge_index: [2, num_edges] 边索引（tensor）
-        """
-        route = route_tensor.tolist()
-        route_len = len(route)
-        
-        edges = set()  # 使用set自动去重
-        
-        # 策略1：添加自环（保留节点自身信息）- 最重要！
         for i in range(route_len):
             edges.add((i, i))
         
-        # 策略2：双向顺序边（允许信息双向流动）
         for i in range(route_len - 1):
-            edges.add((i, i + 1))  # 前向边
-            edges.add((i + 1, i))  # 后向边
+            edges.add((i, i + 1))
+            edges.add((i + 1, i))
         
-        # 策略3：【可选】添加有限的跳跃连接（仅k=2，避免过度连接）
-        # 这允许模型看到"下下个"路段，模拟驾驶时的前瞻
-        if route_len > 2:
-            for i in range(route_len - 2):
-                edges.add((i, i + 2))
-                edges.add((i + 2, i))
+        for i, rid_i in enumerate(route_tuple):
+            if rid_i in self.G:
+                neighbors = set(self.G.neighbors(rid_i)) | set(self.G.predecessors(rid_i))
+                for j, rid_j in enumerate(route_tuple):
+                    if i != j and abs(i - j) <= 2 and rid_j in neighbors:
+                        edges.add((i, j))
         
-        # 转换为tensor并排序（保证确定性）
         edges = sorted(list(edges))
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        
         return edge_index
 
 
 class GTrajRecTestData(TrajRecTestData):
-    """
-    G-TRMMA的测试数据集
-    扩展原始测试数据集，增加路线子图的构建
-    """
     def __init__(self, rn, trajs_dir, mbr, parameters, mode):
-        # 先加载G图
-        self.G = pickle.load(open(os.path.join(parameters.dam_root, "road_graph_wtime"), "rb"))
-        
-        # 调用父类初始化
         super().__init__(rn, trajs_dir, mbr, parameters, mode)
         
-        # 为所有路线构建邻接矩阵
+        self.G = pickle.load(open(os.path.join(parameters.dam_root, "road_graph_wtime"), "rb"))
+        
         self.adj_matrices = []
-        for route in tqdm(self.routes, desc='Building route graphs'):
-            edge_index = self._build_route_graph(route)
+        for route in tqdm(self.routes, desc='Building graphs'):
+            edge_index = self._build_route_graph_with_topology(route)
             self.adj_matrices.append(edge_index)
     
-    def __getitem__(self, index):
-        # 获取基础数据
-        base_data = super().__getitem__(index)
-        
-        # 添加邻接矩阵
-        adj_matrix = self.adj_matrices[index]
-        
-        return base_data + (adj_matrix,)
-    
-    def _build_route_graph(self, route):
-        """
-        根据路线构建子图的边索引
-        【优化版】更稳定的图结构：主要依赖顺序性，减少复杂连接
-        
-        Args:
-            route: list 路线路段ID序列
-        Returns:
-            edge_index: [2, num_edges] 边索引（tensor）
-        """
+    def _build_route_graph_with_topology(self, route):
         route_len = len(route)
+        edges = set()
         
-        edges = set()  # 使用set自动去重
-        
-        # 策略1：添加自环（保留节点自身信息）- 最重要！
         for i in range(route_len):
             edges.add((i, i))
         
-        # 策略2：双向顺序边（允许信息双向流动）
         for i in range(route_len - 1):
-            edges.add((i, i + 1))  # 前向边
-            edges.add((i + 1, i))  # 后向边
+            edges.add((i, i + 1))
+            edges.add((i + 1, i))
         
-        # 策略3：【可选】添加有限的跳跃连接（仅k=2，避免过度连接）
-        # 这允许模型看到"下下个"路段，模拟驾驶时的前瞻
-        if route_len > 2:
-            for i in range(route_len - 2):
-                edges.add((i, i + 2))
-                edges.add((i + 2, i))
+        for i, rid_i in enumerate(route):
+            if rid_i in self.G:
+                neighbors = set(self.G.neighbors(rid_i)) | set(self.G.predecessors(rid_i))
+                for j, rid_j in enumerate(route):
+                    if i != j and abs(i - j) <= 2 and rid_j in neighbors:
+                        edges.add((i, j))
         
-        # 转换为tensor并排序（保证确定性）
         edges = sorted(list(edges))
         edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
-        
         return edge_index
 
+    def __getitem__(self, index):
+        base_data = super().__getitem__(index)
+        adj_matrix = self.adj_matrices[index]
+        return base_data + (adj_matrix,)

@@ -87,9 +87,9 @@ def collate_fn_test(data):
     trg_rid_labels = list(trg_rid_labels)
     for i in range(len(trg_rid_labels)):
         if trg_rid_labels[i].shape[1] < max_da:
-            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1])
+            tmp = torch.zeros(trg_rid_labels[i].shape[0], max_da - trg_rid_labels[i].shape[1]) + 1e-6
             trg_rid_labels[i] = torch.cat([trg_rid_labels[i], tmp], dim=-1)
-    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=0)
+    trg_rid_labels = rnn_utils.pad_sequence(trg_rid_labels, batch_first=True, padding_value=1e-6)
 
     # 邻接矩阵保持为列表
     adj_matrices = list(adj_matrices)
@@ -305,16 +305,15 @@ def infer(model, iterator, rid_features_dict, device):
 def main():
     parser = argparse.ArgumentParser(description='G-TRMMA')  # 创建命令行参数解析器
     parser.add_argument('--city', type=str, default='porto')  # 城市名称，字符串类型，默认porto
-    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')  # 保留比例，浮点型，默认0.125
+    parser.add_argument('--keep_ratio', type=float, default=0.1, help='keep ratio in float')  # 保留比例，浮点型，默认0.125
     parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')  # 教师强制比率，浮点型，默认1
     parser.add_argument('--lambda1', type=int, default=10, help='weight for multi task id')  # 多任务ID损失权重，整型，默认10
     parser.add_argument('--lambda2', type=float, default=5, help='weight for multi task rate')  # 多任务rate损失权重，浮点型，默认5
-    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')  # 隐藏层维度，整型，默认256
+    parser.add_argument('--hid_dim', type=int, default=64, help='hidden dimension')  # 隐藏层维度，整型，默认64
     parser.add_argument('--epochs', type=int, default=30, help='epochs')  # 训练轮数，整型，默认30
-    parser.add_argument('--batch_size', type=int, default=4)  # 批次大小，整型，默认4
+    parser.add_argument('--batch_size', type=int, default=256)  # 批次大小，整型，默认256
     parser.add_argument('--lr', type=float, default=1e-3)  # 学习率，浮点型，默认1e-3
-    parser.add_argument('--transformer_layers', type=int, default=2)  # transformer层数，整型，默认2
-    parser.add_argument('--gnn_layers', type=int, default=2, help='number of GNN layers')  # GNN层数
+    parser.add_argument('--transformer_layers', type=int, default=4)  # transformer层数，整型，默认4
     parser.add_argument('--heads', type=int, default=4)  # 多头注意力头数，整型，默认4
     parser.add_argument("--gpu_id", type=str, default="0")  # GPU编号，字符串类型，默认0
     parser.add_argument('--model_old_path', type=str, default='', help='old model path')  # 旧模型路径，字符串类型，默认空
@@ -323,7 +322,6 @@ def main():
     parser.add_argument('--small', action='store_true')  # 是否使用小数据集，布尔型，出现则为True
     parser.add_argument('--eid_cate', type=str, default='gps2seg')  # eid类别，字符串类型，默认gps2seg
     parser.add_argument('--inferred_seg_path', type=str, default='')  # 推断分段路径，字符串类型，默认空
-    parser.add_argument('--da_route_flag', action='store_true')  # 是否使用DA路线，布尔型，出现则为True
     parser.add_argument('--srcseg_flag', action='store_true')  # 是否使用源分段，布尔型，出现则为True
     parser.add_argument('--gps_flag', action='store_true')  # 是否使用GPS，布尔型，出现则为True
     parser.add_argument('--debug', action='store_true')  # 调试模式，布尔型，出现则为True
@@ -388,7 +386,6 @@ def main():
     args_dict = {  # 定义模型参数字典
         'device': device,  # 设备类型（CPU或GPU）
         'transformer_layers': opts.transformer_layers,  # Transformer层数
-        'gnn_layers': opts.gnn_layers,  # GNN层数
         'heads': opts.heads,  # 注意力头数
         'tandem_fea_flag': True,  # 串联特征标志
         'pro_features_flag': True,  # 专业特征标志
@@ -484,8 +481,16 @@ def main():
         print('model', str(model))
         logging.info('model' + str(model))
 
-        num_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total trainable parameters: {num_params:,}")
+        num_params = 0
+        seg_params = []
+        rate_params = []
+        for name, param in model.named_parameters():
+            num_params += 1
+            if 'fc_rate_out' not in name:
+                seg_params.append(param)
+            else:
+                rate_params.append(param)
+        print(num_params)
 
         ls_train_loss, ls_train_id_acc1, ls_train_id_recall, ls_train_id_precision, \
             ls_train_rate_loss, ls_train_id_loss, ls_train_mae, ls_train_rmse = [], [], [], [], [], [], [], []
@@ -497,13 +502,10 @@ def main():
 
         tb_writer = SummaryWriter(log_dir=os.path.join(model_save_path, 'tensorboard'))
 
-        # get all parameters (model parameters + task dependent log variances)
         lr = args.learning_rate
-        # 使用AdamW优化器（不添加weight decay，避免过度正则化）
         optimizer = optim.AdamW(model.parameters(), lr=lr)
-        # 使用ReduceLROnPlateau（根据性能动态调整，更灵活）
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'min', patience=args.lr_step,
-                                                         factor=args.lr_decay, threshold=1e-3)
+                                                         factor=args.lr_decay, threshold=1e-4)
         stopping_count = 0
         train_times = []
         for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
@@ -532,8 +534,6 @@ def main():
             epoch_secs = end_time - start_time
             train_times.append(end_train - t_train)
 
-            # 【修复】使用RID loss作为主要指标（与TRMMA保持一致）
-            # 因为RID是核心任务，Rate是辅助任务
             if valid_id_loss < best_valid_loss:
                 best_valid_loss = valid_id_loss
                 torch.save(model, os.path.join(model_save_path, 'val-best-model.pt'))
@@ -563,15 +563,14 @@ def main():
             if args.decay_flag:
                 args.tf_ratio = args.tf_ratio * args.decay_ratio
 
-            scheduler.step(valid_id_loss)  # ReduceLROnPlateau需要传入loss
-            lr_last = lr
+            scheduler.step(valid_id_loss)
             lr = optimizer.param_groups[0]['lr']
 
             if lr <= 0.9 * 1e-5:
                 print("==> [Info] Early Stop since lr is too small After Epoch {}.".format(epoch))
                 break
 
-            if stopping_count >= 5:
+            if stopping_count >= 10:
                 print("==> [Info] Early Stop After Epoch {}.".format(epoch))
                 break
         tb_writer.close()
