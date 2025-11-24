@@ -360,12 +360,13 @@ def infer(model, iterator, rid_features_dict, device):
 def main():
     parser = argparse.ArgumentParser(description='E2E Selector+Reconstructor')
     parser.add_argument('--city', type=str, default='porto')
-    parser.add_argument('--keep_ratio', type=float, default=0.125, help='keep ratio in float')
+    parser.add_argument('--keep_ratio', type=float, default=0.1, help='target keep ratio (lower bound)')
+    parser.add_argument('--init_ratio', type=float, default=0.5, help='initial keep ratio for curriculum learning')
     parser.add_argument('--tf_ratio', type=float, default=1, help='teaching ratio in float')
     parser.add_argument('--lambda_selector', type=float, default=1.0, help='weight for selector bce')
     parser.add_argument('--lambda1', type=float, default=10, help='weight for seg bce')
     parser.add_argument('--lambda2', type=float, default=5, help='weight for rate l1')
-    parser.add_argument('--hid_dim', type=int, default=256, help='hidden dimension')
+    parser.add_argument('--hid_dim', type=int, default=64, help='hidden dimension')
     parser.add_argument('--epochs', type=int, default=50, help='epochs')
     parser.add_argument('--batch_size', type=int, default=256)
     parser.add_argument('--lr', type=float, default=1e-3)
@@ -470,6 +471,7 @@ def main():
         # input
         'city': opts.city,
         'keep_ratio': opts.keep_ratio,
+        'init_ratio': opts.init_ratio,
         'grid_size': 50,
         'time_span': ts,
 
@@ -553,7 +555,7 @@ def main():
     for epoch in tqdm(range(args.n_epochs), desc='epoch num'):
         start_time = time.time()
 
-        print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(args.keep_ratio, args.tf_ratio, lr))
+        print("==> training keep_ratio={}, tf_ratio={}, lr={}...".format(train_iterator.dataset.keep_ratio, args.tf_ratio, lr))
         t_train = time.time()
         train_loss, train_selector, train_id, train_rate = train(model, train_iterator, optimizer, criterion, rid_features_dict, args, device)
         end_train = time.time()
@@ -596,12 +598,13 @@ def main():
 
         if (epoch % args.log_step == 0) or (epoch == args.n_epochs - 1):
             logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_secs) + 's')
-            logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(args.keep_ratio))
+            logging.info('Epoch: ' + str(epoch + 1) + ' TF Ratio: ' + str(args.tf_ratio) + ' Keep Ratio: ' + str(train_iterator.dataset.keep_ratio))
             logging.info('\tTrain Total:' + str(train_loss) + '\tSelector:' + str(train_selector) + '\tSeg:' + str(train_id) + '\tRate:' + str(train_rate))
             logging.info('\tValid Total:' + str(valid_loss) + '\tSelector:' + str(valid_selector) + '\tSeg:' + str(valid_id) + '\tRate:' + str(valid_rate))
             torch.save(model, os.path.join(model_save_path, 'train-mid-model.pt'))
         if args.decay_flag:
             args.tf_ratio = args.tf_ratio * args.decay_ratio
+            train_iterator.dataset.keep_ratio = max(args.keep_ratio, train_iterator.dataset.keep_ratio * args.decay_ratio)
 
         scheduler.step(valid_loss)
         lr_last = lr

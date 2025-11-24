@@ -240,7 +240,7 @@ class E2ETrajData(Dataset):
         self.grid_size = parameters.grid_size
         self.time_span = parameters.time_span
         self.mode = mode
-        self.keep_ratio = parameters.keep_ratio
+        self.keep_ratio = getattr(parameters, 'init_ratio', parameters.keep_ratio)
 
         if mode == 'train':
             file = os.path.join(trajs_dir, 'train.pkl')
