@@ -55,10 +55,10 @@ class diff_CSDI(nn.Module):
             embedding_dim,
         )
 
-        self.input_projection = Conv1d_with_init(self.pre_dim + 1, self.channels, 1)
+        self.input_projection = Conv1d_with_init(self.pre_dim * 2 + 1, self.channels, 1)
         self.output_projection1 = Conv1d_with_init(self.channels, self.channels, 1)
         self.output_projection2 = Conv1d_with_init(self.channels, self.channels, 1)
-        self.output_layer = nn.Linear(self.channels, self.pre_dim + 1)
+        self.output_layer = nn.Linear(self.channels, self.pre_dim)
         
         nn.init.zeros_(self.output_projection2.weight)
 
@@ -145,12 +145,8 @@ class Residual_block(nn.Module):
 
     def forward(self, x, diffusion_step_embed):
         # x, mel_spec, diffusion_step_embed = input_data
-        h = x
-        
-
-        # add in diffusion step embedding
-        part_t = self.fc_t(diffusion_step_embed)
-        h += part_t
+        # clone to avoid in-place ops breaking autograd
+        h = x + self.fc_t(diffusion_step_embed)
 
         h = h.permute(0, 2, 1)
         B, C, L = h.shape

@@ -13,22 +13,34 @@ class Diff_RNTraj(nn.Module):
         super(Diff_RNTraj, self).__init__()
         self.diff_model = diff_model
         self.diffusion_param = diffusion_hyperparams
-        
-    def forward(self, spatial_A_trans, SE, src_eid_seqs, src_rate_seqs):
+
+    def forward(self, spatial_A_trans, SE, dense_ids, sparse_ids, mask):
         """
         spatial_A_trans: UTGraph
         SE: pre-trained road segment representation
-        src_eid_seqs: road segment sequence of RNTraj
-        src_rate_seqs: moving rate of RNTraj
+        dense_ids: 稠密路段 ID 序列 (B, T)
+        sparse_ids: 稀疏路段 ID 序列 (B, T)
+        mask: 稀疏掩码 (B, T)
         """
-        batchsize, max_src_len = src_eid_seqs.shape
-        
-        id_embed = SE[src_eid_seqs]  # B, T, d
-        input_data = torch.cat((id_embed, src_rate_seqs.unsqueeze(-1)), -1)  # B, T, d+1
-        
-        diff_noise, const_loss, x0_loss = diff_forward_x0_constraint(self.diff_model, input_data, self.diffusion_param, SE, spatial_A_trans)
-        
-        return diff_noise, const_loss, x0_loss
+        device = SE.device
+
+        # dense / sparse 的路段嵌入 (B, T, D)
+        dense_embed = SE[dense_ids.to(device)]
+        sparse_embed = SE[sparse_ids.to(device)]
+
+        diff_loss, const_loss, x0_loss, sparse_loss, id_loss = diff_forward_x0_constraint(
+            self.diff_model,
+            dense_embed,
+            sparse_embed,
+            mask.to(device),
+            self.diffusion_param,
+            SE,
+            spatial_A_trans.to(device),
+            dense_ids=dense_ids,  # 传递真实的路段ID用于id_loss
+            compute_id_loss=True,  # 训练时计算id_loss
+        )
+
+        return diff_loss, const_loss, x0_loss, sparse_loss, id_loss
 
     def generate_data(self, spatial_A_trans, SE, batchsize, length, pre_dim):
         
