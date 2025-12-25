@@ -22,7 +22,7 @@ if __name__ == '__main__':
     parser.add_argument('--diff_T', type=int, default=500, help='diffusion step')
     parser.add_argument('--beta_start', type=float, default=0.0001, help='min beta')
     parser.add_argument('--beta_end', type=float, default=0.02, help='max beta')
-    parser.add_argument('--pre_trained_dim', type=int, default=64, help='pre-trained dim of the road segment')
+    parser.add_argument('--pre_trained_dim', type=int, default=128, help='pre-trained dim of the road segment')
     parser.add_argument('--rdcl', type=int, default=10, help='stack layers on the denoise network')
     parser.add_argument('--gpu_id', type=str, default='0')
     
@@ -40,7 +40,7 @@ if __name__ == '__main__':
     from common.spatial_func import SPoint, distance
     from build_graph import load_graph_adj_mtx, load_graph_node_features
     from models.model_utils import epoch_time, AttrDict
-    from models.multi_train import init_weights, train, validate
+    from models.multi_train import init_weights, train
     from models.model import Diff_RNTraj
     from models.diff_module import diff_CSDI
 
@@ -73,7 +73,7 @@ if __name__ == '__main__':
             'beta_end': opts.beta_end,
             'pre_trained_dim': opts.pre_trained_dim,
             'rdcl': opts.rdcl,
-            'id_loss_weight': 0.1  # id_loss的权重（可调整，建议0.1-0.5）
+            'id_loss_weight': 1  # id_loss的权重
         }
     elif opts.dataset == 'Chengdu':
         args_dict = {
@@ -101,7 +101,7 @@ if __name__ == '__main__':
             'beta_end': opts.beta_end,
             'pre_trained_dim': opts.pre_trained_dim,
             'rdcl': opts.rdcl,
-            'id_loss_weight': 0.1  # id_loss的权重（可调整，建议0.1-0.5）
+            'id_loss_weight': 1  # id_loss的权重
         }
     
     assert opts.dataset in ['Porto', 'Chengdu'], 'Check dataset name if in [Porto, Chengdu]'
@@ -161,6 +161,11 @@ if __name__ == '__main__':
     SE = torch.from_numpy(SE)
     # 根据 embedding 行数自动更新 id_size，确保与图/映射一致
     args.id_size = N
+    args_dict['id_size'] = N
+    # 根据 embedding 维度自动对齐预训练维度，避免通道数不匹配
+    args.pre_trained_dim = dims
+    opts.pre_trained_dim = dims
+    args_dict['pre_trained_dim'] = dims
 
     # 下方这些原本用于构建路网特征和在线特征的变量，
     # 在当前条件扩散训练流程中暂未使用，为避免对 networkx.read_shp/osgeo 的依赖，这里先注释掉。
@@ -192,12 +197,6 @@ if __name__ == '__main__':
     print(f'Loading training conditional sequences from: {train_cond_path}')
     with open(train_cond_path, 'rb') as f:
         all_cond_dict_train = pickle.load(f)
-    
-    # 加载验证集
-    valid_cond_path = os.path.join(cond_dir, f'cond_seqs_{city_lower}_valid.bin')
-    print(f'Loading validation conditional sequences from: {valid_cond_path}')
-    with open(valid_cond_path, 'rb') as f:
-        all_cond_dict_valid = pickle.load(f)
 
     # 加载 road embed 时生成的节点索引映射，确保 dense/sparse id 与 SE 对齐
     mapping_path = os.path.join(path_dir, 'graph', 'graph_node_id2idx.txt')
@@ -234,18 +233,6 @@ if __name__ == '__main__':
             remapped.append({"dense": dense, "sparse": sparse, "mask": mask})
         remapped_cond_train[L] = remapped
     all_cond_dict = remapped_cond_train
-    
-    # 重映射验证集
-    remapped_cond_valid = {}
-    for L, samples in all_cond_dict_valid.items():
-        remapped = []
-        for sample in samples:
-            dense = remap_seq(sample["dense"])
-            sparse = remap_seq(sample["sparse"])
-            mask = [int(m) for m in sample["mask"]]
-            remapped.append({"dense": dense, "sparse": sparse, "mask": mask})
-        remapped_cond_valid[L] = remapped
-    all_cond_dict_valid = remapped_cond_valid
 
     diff_model = diff_CSDI(args.hid_dim, args.hid_dim, opts.diff_T, args.hid_dim, args.pre_trained_dim, args.rdcl)
     model = Diff_RNTraj(diff_model, diffusion_hyperparams).to(device)
@@ -256,12 +243,10 @@ if __name__ == '__main__':
     with open(model_save_path+'logging.txt', 'a+') as f:
         f.write('model' + str(model) + '\n')
         
+    # 训练损失记录
     ls_train_loss, ls_train_const_loss, ls_train_diff_loss, ls_train_x0_loss, ls_train_sparse_loss, ls_train_id_loss = [], [], [], [], [], []
-    ls_valid_accuracy = []
     
     dict_train_loss = {}
-    
-    best_valid_accuracy = 0.0  # 根据验证集准确率选择最佳模型
 
     # get all parameters (model parameters + task dependent log variances)
     log_vars = [torch.zeros((1,), requires_grad=True, device=device)] * 2  # use for auto-tune multi-task param
@@ -276,12 +261,6 @@ if __name__ == '__main__':
         new_log_vars, train_loss, train_const_loss, train_diff_loss, train_x0_loss, train_sparse_loss, train_id_loss = \
                 train(model, spatial_A_trans, SE, all_cond_dict, optimizer, log_vars, args, diffusion_hyperparams, device)
         scheduler.step()
-        
-        # 每10个epoch在验证集上评估一次
-        if (epoch + 1) % 10 == 0 or epoch == 0:
-            valid_accuracy = validate(model, spatial_A_trans, SE, all_cond_dict_valid, diffusion_hyperparams, device, batch_size=args.batch_size)
-        else:
-            valid_accuracy = None  # 不验证时设为None
 
         ls_train_loss.append(train_loss)
         ls_train_const_loss.append(train_const_loss)
@@ -289,7 +268,6 @@ if __name__ == '__main__':
         ls_train_x0_loss.append(train_x0_loss)
         ls_train_sparse_loss.append(train_sparse_loss)
         ls_train_id_loss.append(train_id_loss)
-        ls_valid_accuracy.append(valid_accuracy)
 
         dict_train_loss['train_ttl_loss'] = ls_train_loss
         dict_train_loss['train_const_loss'] = ls_train_const_loss
@@ -297,66 +275,34 @@ if __name__ == '__main__':
         dict_train_loss['train_x0_loss'] = ls_train_x0_loss
         dict_train_loss['train_sparse_loss'] = ls_train_sparse_loss
         dict_train_loss['train_id_loss'] = ls_train_id_loss
-        dict_train_loss['valid_rid_accuracy'] = ls_valid_accuracy
 
         end_time = time.time()
         epoch_mins, epoch_secs = epoch_time(start_time, end_time)
 
-        # 根据验证集准确率保存最佳模型（只在验证时更新）
-        if valid_accuracy is not None:
-            if valid_accuracy > best_valid_accuracy:
-                best_valid_accuracy = valid_accuracy
-                print(f"Saving best model with validation accuracy: {valid_accuracy:.4f}")
-                torch.save(model.state_dict(), model_save_path + 'val-best-model.pt')
-
         # 打印信息
-        if valid_accuracy is not None:
-            print(f'Epoch: {epoch + 1}/{args.n_epochs} | '
+        print(f'Epoch: {epoch + 1}/{args.n_epochs} | '
                   f'Train Loss: {train_loss:.4f} | '
-                  f'Valid RID Accuracy: {valid_accuracy:.4f} | '
-                  f'Best: {best_valid_accuracy:.4f}')
-        else:
-            print(f'Epoch: {epoch + 1}/{args.n_epochs} | '
-                  f'Train Loss: {train_loss:.4f} | '
-                  f'(Validation skipped, next at epoch {(epoch + 1) // 10 * 10 + 10})')
+              f'Const: {train_const_loss:.4f} | '
+              f'Diff: {train_diff_loss:.4f} | '
+              f'X0: {train_x0_loss:.4f} | '
+              f'Sparse: {train_sparse_loss:.4f} | '
+              f'ID: {train_id_loss:.4f}')
         
         logging.info('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_mins) + 'm' + str(epoch_secs) + 's')
         weights = [torch.exp(weight) ** 0.5 for weight in new_log_vars]
         logging.info('log_vars:' + str(weights))
-        if valid_accuracy is not None:
-            logging.info('\tTrain Loss:' + str(train_loss) +
-                            '\tTrain Const Loss:' + str(train_const_loss) +
-                            '\tTrain Diff Loss:' + str(train_diff_loss) +
-                            '\tTrain X0 Loss:' + str(train_x0_loss) +
-                            '\tTrain Sparse Loss:' + str(train_sparse_loss) +
-                            '\tTrain ID Loss:' + str(train_id_loss) +
-                            '\tValid RID Accuracy:' + str(valid_accuracy))
-            with open(model_save_path+'logging.txt', 'a+') as f:
-                f.write('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_mins) + 'm' + str(epoch_secs) + 's' + '\n')
-                f.write('\tTrain Loss:' + str(train_loss) +
-                            '\tTrain Const Loss:' + str(train_const_loss) +
-                            '\tTrain Diff Loss:' + str(train_diff_loss) +
-                            '\tTrain X0 Loss:' + str(train_x0_loss) +
-                            '\tTrain Sparse Loss:' + str(train_sparse_loss) +
-                            '\tTrain ID Loss:' + str(train_id_loss) +
-                            '\tValid RID Accuracy:' + str(valid_accuracy) +
-                            '\n')
-        else:
-            logging.info('\tTrain Loss:' + str(train_loss) +
-                            '\tTrain Const Loss:' + str(train_const_loss) +
-                            '\tTrain Diff Loss:' + str(train_diff_loss) +
-                            '\tTrain X0 Loss:' + str(train_x0_loss) +
-                            '\tTrain Sparse Loss:' + str(train_sparse_loss) +
-                            '\tTrain ID Loss:' + str(train_id_loss))
-            with open(model_save_path+'logging.txt', 'a+') as f:
-                f.write('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_mins) + 'm' + str(epoch_secs) + 's' + '\n')
-                f.write('\tTrain Loss:' + str(train_loss) +
-                            '\tTrain Const Loss:' + str(train_const_loss) +
-                            '\tTrain Diff Loss:' + str(train_diff_loss) +
-                            '\tTrain X0 Loss:' + str(train_x0_loss) +
-                            '\tTrain Sparse Loss:' + str(train_sparse_loss) +
-                            '\tTrain ID Loss:' + str(train_id_loss) +
-                            '\n')
+        
+        log_str = (f'\tTrain Loss: {train_loss:.4f}'
+                  f'\tConst Loss: {train_const_loss:.4f}'
+                  f'\tDiff Loss: {train_diff_loss:.4f}'
+                  f'\tX0 Loss: {train_x0_loss:.4f}'
+                  f'\tSparse Loss: {train_sparse_loss:.4f}'
+                  f'\tID Loss: {train_id_loss:.4f}')
+        logging.info(log_str)
+        with open(model_save_path+'logging.txt', 'a+') as f:
+            f.write('Epoch: ' + str(epoch + 1) + ' Time: ' + str(epoch_mins) + 'm' + str(epoch_secs) + 's' + '\n')
+            f.write(log_str + '\n')
+                
         torch.save(model.state_dict(), model_save_path + 'train-mid-model.pt')
         save_json_data(dict_train_loss, model_save_path, "train_loss.json")
                 

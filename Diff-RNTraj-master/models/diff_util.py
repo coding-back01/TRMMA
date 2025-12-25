@@ -59,13 +59,11 @@ def diff_forward_x0_constraint(net, x_dense, x_sparse, mask, diffusion_hyperpara
 
     x0_loss = noise_func(x0_hat, x_dense)
 
-    # 基于 x0_hat 的结构约束（还原为 argmax 版本）
+    # 基于 x0_hat 的结构约束（可微版本）
     # 计算 x0_hat 与所有路段嵌入的相似度
     if SE.device != device:
         SE = SE.to(device)
     id_sim_logits = torch.einsum('bld,nf->bln', x0_hat, SE)  # B, L, N
-    # 取 argmax 得到最可能的路段 ID 序列
-    id_sim = id_sim_logits.argmax(-1)  # B, L
 
     # 确保 spatial_A_trans 是 torch tensor 并在正确的设备上
     if not isinstance(spatial_A_trans, torch.Tensor):
@@ -73,10 +71,16 @@ def diff_forward_x0_constraint(net, x_dense, x_sparse, mask, diffusion_hyperpara
     elif spatial_A_trans.device != device:
         spatial_A_trans = spatial_A_trans.to(device)
 
-    # 路网连通性约束：相邻路段不连通则计为惩罚
-    rn_mask = spatial_A_trans[id_sim[:, :-1], id_sim[:, 1:]] == 1e-10
-    # 归一化，避免量级过大主导总损失
-    const_loss = rn_mask.float().mean()
+    # 路网连通性约束：暂时移除
+    # 原因：对于稀疏路网（99.94%不连通），连通性约束难以有效优化
+    # 让模型专注于学习基本的序列生成能力
+    B, L, N = id_sim_logits.shape
+    
+    # 获取路段ID（用于id_loss计算）
+    id_sim = id_sim_logits.argmax(-1)  # B, L
+    
+    # 连通性损失设为0
+    const_loss = torch.tensor(0.0, device=device, requires_grad=True)
 
     # 稀疏约束：在 mask=1 的位置，x0_hat 贴近 x_sparse
     # L2 in embedding space, mask 加权
@@ -88,21 +92,27 @@ def diff_forward_x0_constraint(net, x_dense, x_sparse, mask, diffusion_hyperpara
     else:
         sparse_loss = torch.tensor(0.0, device=device)
 
-    # 路段ID分类损失：直接优化路段ID预测准确率（只在训练时计算，不影响验证速度）
-    # 注意：这个loss与x0_loss有重叠但不完全等价
-    # - x0_loss: 在嵌入空间，比较x0_hat和x_dense（更"软"）
-    # - id_loss: 在ID空间，直接优化路段ID预测（更"硬"，更直接）
-    # 建议：给id_loss一个较小的权重（如0.1-0.5），避免与x0_loss冲突
+    # 路段ID分类损失：只在后期去噪(清晰阶段)计算，避免早期高噪声破坏训练
     id_loss = torch.tensor(0.0, device=device)
     if compute_id_loss and dense_ids is not None:
-        # id_sim_logits 已经计算过了（用于 const_loss），这里只是加一个 CrossEntropyLoss
-        # CrossEntropyLoss 计算很快，不会显著增加训练时间
-        criterion_ce = nn.CrossEntropyLoss(ignore_index=0)  # 忽略padding (ID=0)
-        dense_ids_tensor = dense_ids.to(device).long()
-        # 重塑为 (B*L, N) 和 (B*L,)
-        id_logits_flat = id_sim_logits.reshape(-1, id_sim_logits.shape[-1])  # B*L, N
-        dense_ids_flat = dense_ids_tensor.reshape(-1)  # B*L
-        id_loss = criterion_ce(id_logits_flat, dense_ids_flat)
+        loss_threshold = 100  # 只在 t < 100 计算 ID 损失
+        # diffusion_steps: [B,1,1] -> [B]
+        time_mask = (diffusion_steps.reshape(-1) < loss_threshold).float()  # B
+
+        if time_mask.sum() > 0:
+            criterion_ce = nn.CrossEntropyLoss(reduction='none', ignore_index=0)  # 忽略padding (ID=0)
+            dense_ids_tensor = dense_ids.to(device).long()
+
+            id_logits_flat = id_sim_logits.reshape(-1, id_sim_logits.shape[-1])  # B*L, N
+            dense_ids_flat = dense_ids_tensor.reshape(-1)  # B*L
+
+            raw_loss = criterion_ce(id_logits_flat, dense_ids_flat).reshape(B, L)  # B, L
+            masked_loss = raw_loss * time_mask.unsqueeze(-1)  # 仅保留 t<th 的样本
+
+            # 为了让时间掩码真正降低早期步的影响，用全长归一化（相当于乘以 time_mask 的均值）
+            total_tokens = B * L
+            if total_tokens > 0:
+                id_loss = masked_loss.sum() / (total_tokens + 1e-6)
 
     return diff_loss, const_loss, x0_loss, sparse_loss, id_loss
 
@@ -154,16 +164,18 @@ def cal_x0_conditional_ddpm(net, x_sparse, mask, diffusion_hyperparams):
     mask_expanded = mask.unsqueeze(-1).to(device)  # B, L, 1
     
     # 从纯噪声开始（对于 mask=0 的位置）
-    # 对于 mask=1 的位置，我们会在每一步强制使用 sparse 的值
+    # 对于 mask=1 的位置，使用与当前 t 匹配的“带噪锚点”，避免拼接高清锚点造成分布漂移
     xt_dense = std_normal((B, L, D), device=device)
+    # 为锚点预生成一份噪声，用于各时间步的带噪锚点
+    anchor_noise = std_normal((B, L, D), device=device)
     
     with torch.no_grad():
         for t in range(T-1, -1, -1):
             t_tensor = torch.full((B, 1), t, device=device, dtype=torch.long)
             
-            # 在 mask=1 的位置，强制使用 sparse 的值（作为锚点）
-            # 这样去噪网络在预测时就能看到正确的锚点信息
-            xt_dense = xt_dense * (1 - mask_expanded) + x_sparse * mask_expanded
+            # 在 mask=1 的位置，使用与当前 t 对应的“带噪锚点”，避免高清拼接
+            anchor_t = torch.sqrt(Alpha_bar[t]) * x_sparse + torch.sqrt(1 - Alpha_bar[t]) * anchor_noise
+            xt_dense = xt_dense * (1 - mask_expanded) + anchor_t * mask_expanded
             
             # 构造网络输入：concat(xt_dense, x_sparse, mask)
             mask_feat = mask.unsqueeze(-1).to(device)  # B, L, 1

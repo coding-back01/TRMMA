@@ -1,5 +1,6 @@
 import numpy as np
 import random
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -7,6 +8,7 @@ from tqdm import tqdm
 from models.model_utils import toseq, get_constraint_mask
 from models.loss_fn import cal_id_acc, check_rn_dis_loss, cal_id_acc_train
 from models.trajectory_graph import build_graph,search_road_index
+from models.eval_metrics import DiffusionMetricsTracker, format_metrics
 
 
 def init_weights(self):
@@ -100,9 +102,17 @@ def train(model, spatial_A_trans, SE, all_cond_dict, optimizer, log_vars, parame
     return log_vars, epoch_ttl_loss / cnt, epoch_const_loss / cnt, epoch_diff_loss / cnt, epoch_x0_loss / cnt, epoch_sparse_loss / cnt, epoch_id_loss / cnt
 
 
-def validate(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, device, batch_size=256):
+def validate(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, device, batch_size=256) -> Dict[str, float]:
     """
-    在验证集上评估模型，计算 RID 准确率
+    在验证集上评估模型，使用扩散模型专用的评价指标
+    
+    核心指标：
+    - RSC (Road Segment Connectivity): 路段连通性，衡量生成轨迹的物理合法性
+    - JSD-RS (Road Segment Usage Distribution): 路段使用分布的 Jensen-Shannon 散度
+    
+    参考指标：
+    - LCS Recall/Precision: 基于最长公共子序列的召回率和精确率
+    - Token Accuracy: token级别准确率（仅作参考）
     
     Args:
         model: 训练好的模型
@@ -114,21 +124,22 @@ def validate(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, d
         batch_size: 批处理大小，默认256（与训练保持一致）
     
     Returns:
-        rid_accuracy: RID 准确率
+        metrics: 包含所有评价指标的字典
     """
     model.eval()
     from models.diff_util import cal_x0_conditional_ddpm
     
-    total_correct = 0
-    total_tokens = 0
-    
     SE = SE.to(device)
-    spatial_A_trans = torch.tensor(spatial_A_trans, dtype=torch.float).to(device)
+    spatial_A_trans_tensor = torch.tensor(spatial_A_trans, dtype=torch.float).to(device)
     
     # 预计算 SE 的归一化，避免重复计算
     SE_norm = SE.norm(dim=1, keepdim=True)  # N, 1
+    num_segments = SE.shape[0]
     
-    # 收集所有样本（验证全部10000个样本）
+    # 初始化指标追踪器
+    metrics_tracker = DiffusionMetricsTracker(num_segments, spatial_A_trans_tensor)
+    
+    # 收集所有样本
     all_samples = []
     for L, samples in all_cond_dict.items():
         for sample in samples:
@@ -179,13 +190,27 @@ def validate(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, d
                 # 找到最相似的路段 ID
                 pred_ids = sim_matrix.argmax(dim=1).reshape(B_batch, L)  # B, L
                 
-                # 计算准确率（token-level）
-                correct = (pred_ids == dense_ids_batch).sum().item()
-                total_correct += correct
-                total_tokens += B_batch * L
+                # 更新指标追踪器
+                metrics_tracker.update(pred_ids, dense_ids_batch)
     
-    rid_accuracy = total_correct / max(total_tokens, 1)
-    return rid_accuracy
+    # 计算最终指标
+    metrics = metrics_tracker.compute()
+    return metrics
+
+
+def validate_simple(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, device, batch_size=256) -> float:
+    """
+    简化版验证函数，只返回 RSC（路段连通性）作为主要指标
+    用于向后兼容和快速验证
+    
+    Args:
+        与 validate() 相同
+    
+    Returns:
+        rsc: 路段连通性
+    """
+    metrics = validate(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperparams, device, batch_size)
+    return metrics['rsc']
 
 
 def generate_data(model, spatial_A_trans, rn_dict, parameters, SE):
