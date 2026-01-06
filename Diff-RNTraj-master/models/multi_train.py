@@ -46,8 +46,8 @@ def train(model, spatial_A_trans, SE, all_cond_dict, optimizer, log_vars, parame
     epoch_sparse_loss = 0
     epoch_id_loss = 0
     
-    # id_loss的权重（可调整，建议0.1-0.5）
-    id_loss_weight = getattr(parameters, 'id_loss_weight', 0.1)
+    # id_loss的权重（温和增强，平衡嵌入学习和ID准确性）
+    id_loss_weight = getattr(parameters, 'id_loss_weight', 0.5)
 
     all_batch_dense, all_batch_sparse, all_batch_mask = [], [], []
     batch_size = parameters.batch_size
@@ -213,7 +213,7 @@ def validate_simple(model, spatial_A_trans, SE, all_cond_dict, diffusion_hyperpa
     return metrics['rsc']
 
 
-def generate_data(model, spatial_A_trans, rn_dict, parameters, SE):
+def generate_data(model, spatial_A_trans, rn_dict, parameters, SE, device):
     model.eval()  
     SE = SE.to(device)
     spatial_A_trans = torch.tensor(spatial_A_trans, dtype=torch.float).to(device)

@@ -92,27 +92,32 @@ def diff_forward_x0_constraint(net, x_dense, x_sparse, mask, diffusion_hyperpara
     else:
         sparse_loss = torch.tensor(0.0, device=device)
 
-    # 路段ID分类损失：只在后期去噪(清晰阶段)计算，避免早期高噪声破坏训练
+    # 路段ID分类损失：在所有时间步计算，但对清晰阶段加权
     id_loss = torch.tensor(0.0, device=device)
     if compute_id_loss and dense_ids is not None:
-        loss_threshold = 100  # 只在 t < 100 计算 ID 损失
-        # diffusion_steps: [B,1,1] -> [B]
-        time_mask = (diffusion_steps.reshape(-1) < loss_threshold).float()  # B
+        criterion_ce = nn.CrossEntropyLoss(reduction='none', ignore_index=0)  # 忽略padding (ID=0)
+        dense_ids_tensor = dense_ids.to(device).long()
 
-        if time_mask.sum() > 0:
-            criterion_ce = nn.CrossEntropyLoss(reduction='none', ignore_index=0)  # 忽略padding (ID=0)
-            dense_ids_tensor = dense_ids.to(device).long()
+        id_logits_flat = id_sim_logits.reshape(-1, id_sim_logits.shape[-1])  # B*L, N
+        dense_ids_flat = dense_ids_tensor.reshape(-1)  # B*L
 
-            id_logits_flat = id_sim_logits.reshape(-1, id_sim_logits.shape[-1])  # B*L, N
-            dense_ids_flat = dense_ids_tensor.reshape(-1)  # B*L
+        raw_loss = criterion_ce(id_logits_flat, dense_ids_flat).reshape(B, L)  # B, L
+        
+        # 根据时间步加权：后期（清晰）的损失权重更大
+        # t越小（越清晰）权重越大
+        loss_threshold = 100
+        time_steps = diffusion_steps.reshape(-1)  # B
+        time_weight = torch.where(
+            time_steps < loss_threshold,
+            torch.ones_like(time_steps, dtype=torch.float32),  # t<100: 权重=1
+            torch.full_like(time_steps, 0.3, dtype=torch.float32)  # t>=100: 权重=0.3
+        )
+        
+        weighted_loss = raw_loss * time_weight.unsqueeze(-1)  # B, L
 
-            raw_loss = criterion_ce(id_logits_flat, dense_ids_flat).reshape(B, L)  # B, L
-            masked_loss = raw_loss * time_mask.unsqueeze(-1)  # 仅保留 t<th 的样本
-
-            # 为了让时间掩码真正降低早期步的影响，用全长归一化（相当于乘以 time_mask 的均值）
-            total_tokens = B * L
-            if total_tokens > 0:
-                id_loss = masked_loss.sum() / (total_tokens + 1e-6)
+        total_tokens = B * L
+        if total_tokens > 0:
+            id_loss = weighted_loss.sum() / (total_tokens + 1e-6)
 
     return diff_loss, const_loss, x0_loss, sparse_loss, id_loss
 
@@ -141,15 +146,17 @@ def cal_x0_from_noise_ddpm(net, diffusion_hyperparams, batchsize, length,  featu
                 
     return diff_input
 
-def cal_x0_conditional_ddpm(net, x_sparse, mask, diffusion_hyperparams):
+def cal_x0_conditional_ddpm(net, x_sparse, mask, diffusion_hyperparams, repaint_steps=3):
     """
     条件采样：从噪声开始，使用 sparse 和 mask 作为条件进行去噪
+    增强版：使用 Repaint 策略强化条件约束
     
     Args:
         net: 去噪网络
         x_sparse: B, L, D  稀疏路段嵌入（条件，保持不变）
         mask: B, L         稀疏位置掩码（1=锚点，0=缺失）
         diffusion_hyperparams: 扩散超参数
+        repaint_steps: 每个时间步的重绘次数（推荐3，提升条件约束强度）
     
     Returns:
         x0_hat: B, L, D    生成的 dense 路段嵌入
@@ -163,39 +170,41 @@ def cal_x0_conditional_ddpm(net, x_sparse, mask, diffusion_hyperparams):
     Alpha = Alpha.to(device)
     mask_expanded = mask.unsqueeze(-1).to(device)  # B, L, 1
     
-    # 从纯噪声开始（对于 mask=0 的位置）
-    # 对于 mask=1 的位置，使用与当前 t 匹配的“带噪锚点”，避免拼接高清锚点造成分布漂移
+    # 从纯噪声开始
     xt_dense = std_normal((B, L, D), device=device)
-    # 为锚点预生成一份噪声，用于各时间步的带噪锚点
+    # 为锚点预生成一份固定噪声，保证一致性
     anchor_noise = std_normal((B, L, D), device=device)
     
     with torch.no_grad():
         for t in range(T-1, -1, -1):
-            t_tensor = torch.full((B, 1), t, device=device, dtype=torch.long)
-            
-            # 在 mask=1 的位置，使用与当前 t 对应的“带噪锚点”，避免高清拼接
-            anchor_t = torch.sqrt(Alpha_bar[t]) * x_sparse + torch.sqrt(1 - Alpha_bar[t]) * anchor_noise
-            xt_dense = xt_dense * (1 - mask_expanded) + anchor_t * mask_expanded
-            
-            # 构造网络输入：concat(xt_dense, x_sparse, mask)
-            mask_feat = mask.unsqueeze(-1).to(device)  # B, L, 1
-            net_input = torch.cat([xt_dense, x_sparse.to(device), mask_feat], dim=-1)  # B, L, 2D+1
-            
-            # 预测噪声
-            predict_noise = net(net_input, t_tensor)  # B, L, D
-            
-            # DDPM 去噪步骤
-            coeff1 = 1 / (Alpha[t] ** 0.5)
-            coeff2 = (1 - Alpha[t]) / ((1 - Alpha_bar[t]) ** 0.5)
-            xt_dense = coeff1 * (xt_dense - coeff2 * predict_noise)
-            
-            # 添加噪声（除了最后一步）
-            if t > 0:
-                noise = std_normal(xt_dense.shape, device=device)
-                sigma = ((1 - Alpha_bar[t-1]) / (1 - Alpha_bar[t]) * (1 - Alpha[t])) ** 0.5
-                xt_dense = xt_dense + sigma * noise
+            # Repaint 策略：在每个时间步重复多次（增强条件约束）
+            for _ in range(repaint_steps if t > 0 else 1):
+                t_tensor = torch.full((B, 1), t, device=device, dtype=torch.long)
+                
+                # === 关键优化 1：强制条件约束（Inpainting） ===
+                # 在 mask=1 的位置，使用与当前 t 匹配的"带噪锚点"
+                anchor_t = torch.sqrt(Alpha_bar[t]) * x_sparse + torch.sqrt(1 - Alpha_bar[t]) * anchor_noise
+                xt_dense = xt_dense * (1 - mask_expanded) + anchor_t * mask_expanded
+                
+                # 构造网络输入
+                mask_feat = mask.unsqueeze(-1).to(device)
+                net_input = torch.cat([xt_dense, x_sparse.to(device), mask_feat], dim=-1)
+                
+                # 预测噪声
+                predict_noise = net(net_input, t_tensor)
+                
+                # DDPM 去噪步骤
+                coeff1 = 1 / torch.sqrt(Alpha[t])
+                coeff2 = (1 - Alpha[t]) / torch.sqrt(1 - Alpha_bar[t])
+                xt_dense = coeff1 * (xt_dense - coeff2 * predict_noise)
+                
+                # 添加后验方差噪声
+                if t > 0:
+                    noise = std_normal(xt_dense.shape, device=device)
+                    sigma = torch.sqrt((1 - Alpha_bar[t-1]) / (1 - Alpha_bar[t]) * (1 - Alpha[t]))
+                    xt_dense = xt_dense + sigma * noise
         
-        # 最后一步，确保 mask=1 的位置使用 sparse 的值
+        # 最终强制保持已知部分
         xt_dense = xt_dense * (1 - mask_expanded) + x_sparse * mask_expanded
                 
     return xt_dense

@@ -38,6 +38,13 @@ if __name__ == '__main__':
     parser.add_argument('--pre_trained_dim', type=int, default=128, help='pre-trained dim of the road segment')
     parser.add_argument('--rdcl', type=int, default=10, help='stack layers on the denoise network')
     parser.add_argument('--gpu_id', type=str, default='0')
+    
+    # 优化参数
+    parser.add_argument('--repaint_steps', type=int, default=3, help='repaint steps for stronger conditioning (推荐3)')
+    parser.add_argument('--use_beam_search', type=int, default=1, help='use beam search (1=yes, 0=no, 推荐1)')
+    parser.add_argument('--beam_size', type=int, default=5, help='beam size (推荐5)')
+    parser.add_argument('--alpha', type=float, default=0.7, help='similarity weight (推荐0.7)')
+    
     opts = parser.parse_args()
 
     os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpu_id
@@ -67,6 +74,7 @@ if __name__ == '__main__':
     args.update(args_dict)
 
     print('Preparing data...')
+    print(f'优化配置: repaint_steps={opts.repaint_steps}, use_beam_search={opts.use_beam_search}, beam_size={opts.beam_size}, alpha={opts.alpha}')
 
     beta = np.linspace(opts.beta_start ** 0.5, opts.beta_end ** 0.5, opts.diff_T) ** 2
     alpha = 1 - beta
@@ -170,6 +178,61 @@ if __name__ == '__main__':
     # 预计算 SE 的范数，避免重复计算
     SE_norm = SE.norm(dim=1, keepdim=True)  # N,1
 
+    # === 连通性后处理函数（Beam Search） ===
+    def beam_search_decode(x0_hat, SE, spatial_A_trans, mask, sparse_ids, beam_size=5, alpha=0.7):
+        """使用 Beam Search 保证连通性"""
+        B, L, D = x0_hat.shape
+        N = SE.shape[0]
+        device = x0_hat.device
+        
+        # 计算相似度矩阵
+        x0_hat_norm = x0_hat / (x0_hat.norm(dim=2, keepdim=True) + 1e-8)
+        SE_norm_local = SE / (SE.norm(dim=1, keepdim=True) + 1e-8)
+        sim_matrix = torch.einsum('bld,nd->bln', x0_hat_norm, SE_norm_local)
+        
+        pred_ids = torch.zeros(B, L, dtype=torch.long, device=device)
+        
+        for b in range(B):
+            curr_sim = sim_matrix[b]
+            curr_mask = mask[b]
+            curr_sparse = sparse_ids[b]
+            result_path = torch.zeros(L, dtype=torch.long, device=device)
+            
+            for pos in range(L):
+                if curr_mask[pos] == 1:
+                    result_path[pos] = curr_sparse[pos]
+                else:
+                    if pos == 0:
+                        result_path[pos] = curr_sim[pos].argmax()
+                    else:
+                        prev_id = result_path[pos - 1].item()
+                        topk_scores, topk_ids = torch.topk(curr_sim[pos], min(beam_size * 2, N))
+                        
+                        best_id = topk_ids[0].item()
+                        best_score = -float('inf')
+                        
+                        for k in range(len(topk_ids)):
+                            cand_id = topk_ids[k].item()
+                            sim_score = topk_scores[k].item()
+                            
+                            # 连通性加成
+                            if spatial_A_trans[prev_id, cand_id] > 1e-9:
+                                conn_bonus = 0.5
+                            else:
+                                conn_bonus = -0.3
+                            
+                            total = alpha * sim_score + (1 - alpha) * conn_bonus
+                            
+                            if total > best_score:
+                                best_score = total
+                                best_id = cand_id
+                        
+                        result_path[pos] = best_id
+            
+            pred_ids[b] = result_path
+        
+        return pred_ids
+
     with torch.no_grad():
         for L, samples in all_cond_dict.items():
             for batch_idx in range(0, len(samples), opts.batch_size):
@@ -187,20 +250,28 @@ if __name__ == '__main__':
                 # 条件嵌入
                 sparse_embed = SE[sparse_ids]  # B, L, D
 
-                # 条件采样（扩散去噪）
+                # === 优化 1：条件采样（使用 repaint 强化约束） ===
                 x0_hat = cal_x0_conditional_ddpm(
                     model.diff_model,
                     sparse_embed,
                     mask,
-                    diffusion_hyperparams
+                    diffusion_hyperparams,
+                    repaint_steps=opts.repaint_steps
                 )  # B, L, D
 
-                # 最近邻映射回路段ID
-                B_, L_, D = x0_hat.shape
-                x0_hat_flat = x0_hat.reshape(B_ * L_, D)  # BL, D
-                x0_hat_norm = x0_hat_flat.norm(dim=1, keepdim=True)  # BL,1
-                sim_matrix = torch.mm(x0_hat_flat, SE.t()) / (torch.mm(x0_hat_norm, SE_norm.t()) + 1e-6)  # BL, N
-                pred_ids = sim_matrix.argmax(dim=1).reshape(B, L_)
+                # === 优化 2：连通性约束的离散化 ===
+                if opts.use_beam_search:
+                    pred_ids = beam_search_decode(
+                        x0_hat, SE, spatial_A_trans_tensor, mask, sparse_ids,
+                        beam_size=opts.beam_size, alpha=opts.alpha
+                    )
+                else:
+                    # 原始方法：简单的最近邻
+                    B_, L_, D = x0_hat.shape
+                    x0_hat_flat = x0_hat.reshape(B_ * L_, D)
+                    x0_hat_norm = x0_hat_flat.norm(dim=1, keepdim=True)
+                    sim_matrix = torch.mm(x0_hat_flat, SE.t()) / (torch.mm(x0_hat_norm, SE_norm.t()) + 1e-6)
+                    pred_ids = sim_matrix.argmax(dim=1).reshape(B, L_)
 
                 # 更新指标追踪器
                 metrics_tracker.update(pred_ids, dense_ids)

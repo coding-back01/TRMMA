@@ -73,7 +73,7 @@ if __name__ == '__main__':
             'beta_end': opts.beta_end,
             'pre_trained_dim': opts.pre_trained_dim,
             'rdcl': opts.rdcl,
-            'id_loss_weight': 1  # id_loss的权重
+            'id_loss_weight': 0.5  # id_loss的权重（温和增强，平衡嵌入学习和ID准确性）
         }
     elif opts.dataset == 'Chengdu':
         args_dict = {
@@ -101,7 +101,7 @@ if __name__ == '__main__':
             'beta_end': opts.beta_end,
             'pre_trained_dim': opts.pre_trained_dim,
             'rdcl': opts.rdcl,
-            'id_loss_weight': 1  # id_loss的权重
+            'id_loss_weight': 0.5  # id_loss的权重（温和增强，平衡嵌入学习和ID准确性）
         }
     
     assert opts.dataset in ['Porto', 'Chengdu'], 'Check dataset name if in [Porto, Chengdu]'
